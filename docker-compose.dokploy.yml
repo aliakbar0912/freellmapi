@@ -1,0 +1,39 @@
+# Dokploy deployment for the combined dashboard + API.
+# Keep exactly ONE replica: the application uses a local SQLite database.
+services:
+  freellmapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      TRUST_PROXY: "1"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      FREEAPI_DB_BACKUP_URL: ${FREEAPI_DB_BACKUP_URL}
+      FREEAPI_DB_BACKUP_TOKEN: ${FREEAPI_DB_BACKUP_TOKEN}
+      FREEAPI_DB_BACKUP_INTERVAL_MS: ${FREEAPI_DB_BACKUP_INTERVAL_MS:-300000}
+      # If the old deployment explicitly used FREEAPI_DB_BACKUP_KEY, set the
+      # exact same value here. Otherwise the app uses ENCRYPTION_KEY.
+      FREEAPI_DB_BACKUP_KEY: ${FREEAPI_DB_BACKUP_KEY:-}
+    expose:
+      - "3001"
+    volumes:
+      - freellmapi-data:/app/server/data
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/api/ping').then((res) => { if (!res.ok) process.exit(1); }).catch(() => process.exit(1));"
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  freellmapi-data:
