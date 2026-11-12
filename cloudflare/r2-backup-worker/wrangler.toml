@@ -1,0 +1,7 @@
+name = "freellmapi-r2-backup"
+main = "src/index.js"
+compatibility_date = "2026-11-13"
+
+[[r2_buckets]]
+binding = "DB_BACKUPS"
+bucket_name = "freellmapi-db-backups"
