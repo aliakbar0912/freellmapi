@@ -93,6 +93,13 @@ describe('Keys API', () => {
     expect(body.maskedKey).toContain('...');
   });
 
+  it.each(['typecast', 'cartesia', 'silvr'])('adds a %s key without seeding fresh catalog models', async platform => {
+    const { status, body } = await request(app, 'POST', '/api/keys', { platform, key: 'synthetic-voice-key' });
+    expect(status).toBe(201); expect(body.platform).toBe(platform);
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM models WHERE platform=?').get(platform)).toEqual({ n: 0 });
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM media_models WHERE platform=?').get(platform)).toEqual({ n: 0 });
+  });
+
   it('GET /api/keys returns the created key', async () => {
     // First create a key
     await request(app, 'POST', '/api/keys', {
@@ -104,6 +111,24 @@ describe('Keys API', () => {
     expect(status).toBe(200);
     expect(body).toHaveLength(1);
     expect(body[0].platform).toBe('groq');
+  });
+
+  it('GET /api/keys exposes verificationBasis (#1516, display-only)', async () => {
+    // A fresh key has never been verified, so the basis is null; once a real
+    // request upgrades it, the same row reads 'inference_verified'.
+    await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+
+    const first = await request(app, 'GET', '/api/keys');
+    expect(first.status).toBe(200);
+    expect(first.body).toHaveLength(1);
+    expect(first.body[0].verificationBasis).toBeNull();
+
+    getDb().prepare("UPDATE api_keys SET verification_basis = 'inference_verified'").run();
+    const second = await request(app, 'GET', '/api/keys');
+    expect(second.body[0].verificationBasis).toBe('inference_verified');
   });
 
   it('POST /api/keys warns when the platform has no catalog models yet (#438)', async () => {
@@ -217,7 +242,7 @@ describe('Keys API', () => {
     expect(status).toBe(400);
   });
 
-  it.each(['aclide', 'speka', 'electronhub', 'experiential', 'router9', 'septor', 'clod', 'speechify', 'blaze', 'lucidity', 'airforce', 'dreamprompting', 'waterfall', 'logfare'])('accepts a %s key without seeding gated model rows', async platform => {
+  it.each(['varosity', 'freeinference', 'novai', 'nabh', 'freeai', 'inferbase', 'simplellm', 'aclide', 'speka', 'electronhub', 'experiential', 'router9', 'septor', 'clod', 'speechify', 'blaze', 'lucidity', 'airforce', 'dreamprompting', 'waterfall', 'logfare'])('accepts a %s key without seeding gated model rows', async platform => {
     const { status, body } = await request(app, 'POST', '/api/keys', {
       platform, key: 'not-a-real-test-key-12345', label: 'Gateway test',
     });
@@ -232,6 +257,15 @@ describe('Keys API', () => {
       platform: 'groq',
     });
     expect(status).toBe(400);
+  });
+
+  it('accepts a local FreeTTS key without seeding chat or tier-gated audio rows', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'freetts', key: 'ft_live_synthetic_key_not_real', label: 'Personal TTS',
+    });
+    expect(status).toBe(201); expect(body.platform).toBe('freetts'); expect(body.modelsAvailable).toBe(0);
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM models WHERE platform='freetts'").get()).toEqual({ n: 0 });
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM media_models WHERE platform='freetts'").get()).toEqual({ n: 0 });
   });
 
   it('DELETE /api/keys/:id removes a key', async () => {
@@ -250,6 +284,40 @@ describe('Keys API', () => {
   it('DELETE /api/keys/:id returns 404 for nonexistent key', async () => {
     const { status } = await request(app, 'DELETE', '/api/keys/99999');
     expect(status).toBe(404);
+  });
+
+  it('DELETE /api/keys/:id sweeps key-bound rows on standard platforms (#1516)', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+    const db = getDb();
+    // A key-bound chat row plus its fallback row, embedding row and media row.
+    // Shared catalog rows (key_id NULL) must survive the delete.
+    const chat = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, key_id, enabled, source)
+      VALUES ('groq', 'orphan-chat-1516', 'Orphan Chat', 50, 50, 'Large', ?, 1, 'user')
+    `).run(created.id);
+    db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 9999, 1)').run(chat.lastInsertRowid);
+    db.prepare(`
+      INSERT INTO embedding_models (family, platform, model_id, display_name, dimensions, priority, enabled, quota_label, key_id)
+      VALUES ('fam-1516', 'groq', 'orphan-embed-1516', 'Orphan Embed', 768, 1, 1, 'test', ?)
+    `).run(created.id);
+    db.prepare(`
+      INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, key_id)
+      VALUES ('groq', 'orphan-tts-1516', 'Orphan TTS', 'audio', 1, 1, 'test', ?)
+    `).run(created.id);
+    const sharedBefore = (db.prepare("SELECT COUNT(*) AS n FROM models WHERE platform = 'groq' AND key_id IS NULL").get() as { n: number }).n;
+
+    const { status } = await request(app, 'DELETE', `/api/keys/${created.id}`);
+    expect(status).toBe(200);
+
+    expect(db.prepare('SELECT COUNT(*) AS n FROM models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM embedding_models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM media_models WHERE key_id = ?').get(created.id)).toEqual({ n: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(chat.lastInsertRowid)).toEqual({ n: 0 });
+    // Shared catalog rows are untouched.
+    expect(db.prepare("SELECT COUNT(*) AS n FROM models WHERE platform = 'groq' AND key_id IS NULL").get()).toEqual({ n: sharedBefore });
   });
 
   it('PATCH /api/keys/:id updates label', async () => {
@@ -358,19 +426,71 @@ describe('Keys API', () => {
     expect(row.last_checked_at).toBeTruthy();
   });
 
-  it('PATCH /api/keys/:id rejects a credential for a keyless provider', async () => {
-    const { body: created } = await request(app, 'POST', '/api/keys', {
-      platform: 'kilo',
-      key: '',
-    });
+  // #1331: key-optional providers (Kilo, OVH, AI Horde) accept a real key.
+  const storedKey = (id: number) => {
+    const row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(id) as any;
+    return decrypt(row.encrypted_key, row.iv, row.auth_tag);
+  };
 
-    const { status } = await request(app, 'PATCH', `/api/keys/${created.id}`, {
-      key: 'unexpected-secret',
-    });
+  it('PATCH /api/keys/:id stores a real credential on a key-optional provider', async () => {
+    const { body: created } = await request(app, 'POST', '/api/keys', { platform: 'kilo', key: '' });
+    expect(storedKey(created.id)).toBe('no-key');
 
-    expect(status).toBe(400);
-    const row = getDb().prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(created.id) as any;
-    expect(decrypt(row.encrypted_key, row.iv, row.auth_tag)).toBe('no-key');
+    const { status, body } = await request(app, 'PATCH', `/api/keys/${created.id}`, { key: 'kilo-real-secret' });
+
+    expect(status).toBe(200);
+    expect(body.maskedKey).not.toContain('kilo-real-secret');
+    const row = getDb().prepare('SELECT encrypted_key, status FROM api_keys WHERE id = ?').get(created.id) as any;
+    expect(row.encrypted_key).not.toContain('kilo-real-secret');
+    expect(row.status).toBe('unknown');
+    expect(storedKey(created.id)).toBe('kilo-real-secret');
+  });
+
+  it.each(['kilo', 'ovh', 'aihorde', 'parallel', 'keenable'])('POST /api/keys without a key stores one anonymous %s row', async (platform) => {
+    const first = await request(app, 'POST', '/api/keys', { platform });
+    const second = await request(app, 'POST', '/api/keys', { platform, key: '   ' });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(second.body.id).toBe(first.body.id);
+    expect(storedKey(first.body.id)).toBe('no-key');
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatchObject({ platform, keyless: true, keyOptional: true, exportable: false });
+  });
+
+  it.each(['kilo', 'ovh', 'aihorde', 'parallel', 'keenable'])('POST /api/keys stores a real %s key encrypted', async (platform) => {
+    const { status, body } = await request(app, 'POST', '/api/keys', { platform, key: ` ${platform}-secret-123 `, label: 'mine' });
+
+    expect(status).toBe(201);
+    expect(body.maskedKey).not.toContain(`${platform}-secret-123`);
+    expect(storedKey(body.id)).toBe(`${platform}-secret-123`);
+    const { body: keys } = await request(app, 'GET', '/api/keys');
+    expect(keys[0]).toMatchObject({ platform, label: 'mine', keyless: false, keyOptional: true, exportable: true });
+  });
+
+  it('POST /api/keys upgrades the anonymous row in place when a real key arrives', async () => {
+    const { body: anon } = await request(app, 'POST', '/api/keys', { platform: 'ovh' });
+    getDb().prepare("UPDATE api_keys SET status = 'healthy', enabled = 0 WHERE id = ?").run(anon.id);
+
+    const { status, body } = await request(app, 'POST', '/api/keys', { platform: 'ovh', key: 'ovh-token-abc', label: 'Work' });
+
+    expect(status).toBe(200);
+    expect(body.id).toBe(anon.id);
+    expect(storedKey(anon.id)).toBe('ovh-token-abc');
+    const row = getDb().prepare('SELECT label, status, enabled FROM api_keys WHERE id = ?').get(anon.id) as any;
+    expect(row).toEqual({ label: 'Work', status: 'unknown', enabled: 1 });
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'ovh'").get()).toEqual({ n: 1 });
+  });
+
+  it('POST /api/keys adds a second real key alongside an existing one on a key-optional provider', async () => {
+    const { body: a } = await request(app, 'POST', '/api/keys', { platform: 'aihorde', key: 'horde-a' });
+    const { status, body: b } = await request(app, 'POST', '/api/keys', { platform: 'aihorde', key: 'horde-b' });
+
+    expect(status).toBe(201);
+    expect(b.id).not.toBe(a.id);
+    expect(storedKey(a.id)).toBe('horde-a');
+    expect(storedKey(b.id)).toBe('horde-b');
   });
 
   it('PATCH /api/keys/:id clears label', async () => {

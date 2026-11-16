@@ -18,6 +18,7 @@ import { qualifiedModelMemberId } from '../lib/endpoint-scope.js';
 import { overriddenFieldNames } from '../services/model-state.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
 import { getQuotaOutlook } from '../services/quota-outlook.js';
+import { getDecisionRoutingStatus, setDecisionRoutingSettings } from '../services/routing-decision.js';
 
 export const fallbackRouter = Router();
 
@@ -39,6 +40,9 @@ fallbackRouter.get('/routing', (_req: Request, res: Response) => {
     peakEndHour: peakHours.endHour,
     peakTimezone: peakHours.timezone,
     cooldownCeilingMs: getCooldownCeilingMs(),
+    // Decision routing (#1354): its settings, whether a decision model is
+    // usable, and since-boot picks. Present whatever the active strategy is.
+    decision: getDecisionRoutingStatus(),
   });
 });
 
@@ -54,7 +58,7 @@ fallbackRouter.delete('/penalty-inspector', (_req: Request, res: Response) => {
 });
 
 const routingSchema = z.object({
-  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']),
+  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom', 'decision']),
   // Only meaningful with strategy 'custom': the user's weight vector. Any
   // non-negative vector is accepted; setCustomWeights renormalizes to sum 1.
   weights: z.object({
@@ -81,6 +85,11 @@ const routingSchema = z.object({
     .min(MIN_COOLDOWN_CEILING_MS, { message: `cooldownCeilingMs must be at least ${MIN_COOLDOWN_CEILING_MS} (1 minute)` })
     .max(MAX_COOLDOWN_CEILING_MS, { message: `cooldownCeilingMs must be at most ${MAX_COOLDOWN_CEILING_MS} (24 hours)` })
     .nullable().optional(),
+  // Decision routing (#1354): which decision model picks the preset ('auto' or
+  // a decision model id) and the top probability below which it routes as
+  // Balanced. Saved whatever the strategy, so they can be set before switching.
+  decisionModel: z.string().trim().min(1).max(200).optional(),
+  decisionMinProbability: z.number().min(0).max(1).optional(),
 });
 
 // PUT /routing → switch strategy. Presets are just weight vectors over the three
@@ -89,7 +98,7 @@ const routingSchema = z.object({
 fallbackRouter.put('/routing', (req: Request, res: Response) => {
   const parsed = routingSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
   // Persist the weights before flipping the strategy so the new mode reads the
@@ -112,6 +121,7 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
   if (parsed.data.cooldownCeilingMs !== undefined) {
     setCooldownCeilingMs(parsed.data.cooldownCeilingMs);
   }
+  setDecisionRoutingSettings({ model: parsed.data.decisionModel, minProbability: parsed.data.decisionMinProbability });
   try {
     setPeakHoursConfig({
       enabled: parsed.data.peakHoursAdjust,
@@ -133,6 +143,7 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
     strategy: getRoutingStrategy(),
     exploreEnabled: getExploreEnabled(),
     keySelectionStrategy: getKeySelectionStrategy(),
+    decision: getDecisionRoutingStatus(),
     presets: BANDIT_PRESETS,
     weights: active.weights,
     peakAdjusted: active.adjusted,
@@ -152,7 +163,7 @@ const MODEL_COLUMNS = `
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, m.endpoint_scope, ak.label AS key_label,
+           m.key_id, m.endpoint_scope, m.source AS model_source, ak.label AS key_label,
            mo.overrides_json IS NOT NULL AS has_overrides,
            mo.overrides_json,
            ts.source AS tombstone_source, ts.reason AS tombstone_reason`;
@@ -298,7 +309,11 @@ fallbackRouter.get('/', (req: Request, res: Response) => {
       monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget) * Math.max(1, keyCountMap.get(r.platform) ?? 1),
       supportsVision: r.supports_vision === 1,
       supportsTools: r.supports_tools === 1,
-      source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
+      // 'discovered' (#1348): fetched from a built-in provider's /models because
+      // the catalog carries none for it. Routes like a catalog row.
+      source: r.platform === 'custom' || r.key_id != null
+        ? 'custom'
+        : r.model_source === 'discovered' ? 'discovered' : 'catalog',
       keyId: r.key_id ?? null,
       keyLabel: r.key_label ?? null,
       // Which relay endpoint a custom row belongs to, and the id that names it
@@ -343,7 +358,7 @@ function knownModelIds(db: ReturnType<typeof getDb>): Set<number> {
 fallbackRouter.put('/', (req: Request, res: Response) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
 
@@ -408,7 +423,10 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
     allModels.sort((a, b) => monthlyBudgetScore(b) - monthlyBudgetScore(a));
     models = allModels.map(m => ({ id: m.id }));
   } else {
-    const orderBy = SORT_PRESETS[preset];
+    // `Object.hasOwn`, not a bare index: a plain read answers for inherited
+    // members too, so `POST /sort/constructor` used to slip past this guard
+    // (the function object is truthy) and crash `prepare()` with a 500.
+    const orderBy = Object.hasOwn(SORT_PRESETS, preset) ? SORT_PRESETS[preset] : undefined;
     if (!orderBy) {
       res.status(400).json({ error: { message: `Unknown preset: ${preset}. Use: intelligence, speed, budget` } });
       return;
@@ -496,11 +514,9 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
 
   // Build per-model breakdown (only platforms with keys), preserving enabled state
   const usageRows = db.prepare(`
-    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-    GROUP BY platform, model_id
+    SELECT platform, model_id, tokens AS used
+    FROM model_monthly_usage
+    WHERE month = strftime('%Y-%m', 'now')
   `).all() as { platform: string; model_id: string; used: number }[];
   const usageByModel = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
 

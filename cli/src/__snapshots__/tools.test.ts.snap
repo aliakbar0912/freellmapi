@@ -25,12 +25,15 @@ exports[`tool generators > setup-atomcode has stable golden output 1`] = `
 {
   "files": [
     {
-      "content": "default_provider = "freellmapi"
+      "content": "default_model = "freellmapi"
 
-[providers.freellmapi]
-type = "openai"
+[provider_accounts.freellmapi]
+provider = "openai"
 base_url = "http://localhost:3000/v1"
 api_key = "freellmapi-test-key"
+
+[models.freellmapi]
+account = "freellmapi"
 model = "fast-coder"
 context_window = 131072",
       "format": "toml",
@@ -39,8 +42,8 @@ context_window = 131072",
     },
   ],
   "notes": [
-    "AtomCode reads ~/.atomcode/config.toml; other [providers.*] tables in it are kept.",
-    "default_provider now points at [providers.freellmapi] with fast-coder as its model.",
+    "AtomCode reads ~/.atomcode/config.toml; unrelated accounts, models and legacy providers are kept.",
+    "default_model now points at [models.freellmapi] with fast-coder via [provider_accounts.freellmapi].",
     "Point base_url at the unified /v1 endpoint; api_key is the unified key shown on the Agents page.",
     "One-shot check: atomcode -p "Say hello" (telemetry is on by default: atomcode telemetry disable).",
   ],
@@ -137,6 +140,8 @@ requires_openai_auth = false
     },
   ],
   "notes": [
+    "No Codex CLI detected on this machine.",
+    "Install the CLI with: npm install -g @openai/codex",
     "Export FREELLMAPI_API_KEY before running codex; the key is not written to config.toml.",
     "Selected fast-coder with a 131072 token context window.",
   ],
@@ -165,6 +170,8 @@ model_provider = "freellmapi"
     },
   ],
   "notes": [
+    "No Codex CLI detected on this machine.",
+    "Install the CLI with: npm install -g @openai/codex",
     "Export FREELLMAPI_API_KEY before running codex; the key is not written to config.toml.",
     "Activate this profile with: codex --profile work",
     "Selected fast-coder with a 131072 token context window.",
@@ -636,17 +643,101 @@ exports[`tool generators > setup-opencode has stable golden output 1`] = `
             "name": "FreeLLMAPI",
             "npm": "@ai-sdk/openai-compatible",
             "options": {
-              "apiKey": "{env:FREELLMAPI_API_KEY}",
+              "apiKey": undefined,
               "baseURL": "http://localhost:3000/v1",
             },
           },
         },
       },
     },
+    {
+      "format": "json",
+      "path": "/home/tester/.local/share/opencode/auth.json",
+      "sensitive": true,
+      "value": {
+        "freellmapi": {
+          "key": "freellmapi-test-key",
+          "type": "api",
+        },
+      },
+    },
   ],
   "notes": [
-    "Export FREELLMAPI_API_KEY before starting OpenCode.",
+    "The key is stored in OpenCode's auth.json, so no environment variable is needed (CLI or desktop app).",
     "freellmapi/fast-coder is now the default model.",
+  ],
+}
+`;
+
+exports[`tool generators > setup-pi has stable golden output 1`] = `
+{
+  "files": [
+    {
+      "format": "json",
+      "path": "/home/tester/.pi/agent/models.json",
+      "sensitive": true,
+      "value": {
+        "providers": {
+          "freellmapi": {
+            "api": "openai-completions",
+            "apiKey": "freellmapi-test-key",
+            "baseUrl": "http://localhost:3000/v1",
+            "headers": {
+              "User-Agent": "pi-coding-agent",
+            },
+            "models": [
+              {
+                "contextWindow": 131072,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                },
+                "id": "fast-coder",
+                "input": [
+                  "text",
+                ],
+                "maxTokens": 8192,
+                "name": "Fast Coder",
+                "reasoning": false,
+              },
+              {
+                "contextWindow": 262144,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                },
+                "id": "reasoning-model",
+                "input": [
+                  "text",
+                ],
+                "maxTokens": 8192,
+                "name": "Reasoning Model",
+                "reasoning": false,
+              },
+            ],
+            "name": "FreeLLMAPI",
+          },
+        },
+      },
+    },
+    {
+      "format": "json",
+      "path": "/home/tester/.pi/agent/settings.json",
+      "value": {
+        "defaultModel": "fast-coder",
+        "defaultProvider": "freellmapi",
+      },
+    },
+  ],
+  "notes": [
+    "Install Pi with: npm install -g @earendil-works/pi-coding-agent (or curl -fsSL https://pi.dev/install.sh | sh)",
+    "Try it with: pi -p "Say hello" — freellmapi/fast-coder is the default model.",
+    "Every catalog model is in /model; a running Pi session picks the change up when /model is opened.",
+    "Models are declared text-only; give a vision model \`input: ["text", "image"]\` under providers.freellmapi in models.json to send it images.",
   ],
 }
 `;
@@ -703,6 +794,42 @@ exports[`tool generators > setup-qwen has stable golden output 1`] = `
   ],
   "notes": [
     "Native Gemini mode is also available at http://localhost:3000/v1beta with GEMINI_API_KEY.",
+  ],
+}
+`;
+
+exports[`tool generators > setup-reasonix has stable golden output 1`] = `
+{
+  "files": [
+    {
+      "content": "default_model = "freellmapi/fast-coder"
+
+[[providers]]
+name = "freellmapi"
+display_name = "FreeLLMAPI"
+kind = "openai"
+base_url = "http://localhost:3000/v1"
+models = ["fast-coder", "reasoning-model"]
+default = "fast-coder"
+api_key_env = "FREELLMAPI_API_KEY"
+context_window = 131072
+price = { cache_hit = 0, input = 0, output = 0, currency = "$" }",
+      "format": "toml",
+      "path": "/home/tester/.reasonix/config.toml",
+    },
+    {
+      "content": "FREELLMAPI_API_KEY=freellmapi-test-key
+",
+      "format": "env",
+      "path": "/home/tester/.reasonix/.env",
+      "sensitive": true,
+    },
+  ],
+  "notes": [
+    "Install Reasonix with: npm install -g reasonix (or brew install esengine/reasonix/reasonix)",
+    "Try it with: reasonix -p "Say hello" — freellmapi/fast-coder is the default model.",
+    "Every catalog model is in /model as freellmapi/<id>; other [[providers]] entries in config.toml are kept.",
+    "Reasonix Studio lists only the providers in [desktop].provider_access when that list is set; add "freellmapi" there, or under Settings → Model → Access.",
   ],
 }
 `;
@@ -774,6 +901,123 @@ exports[`tool generators > setup-roo has stable golden output 1`] = `
     "Roo CLI: merge {"roo-cline.autoImportSettingsPath": "/home/tester/.roo/freellmapi-cli.json"} into ~/.vscode-mock/global-storage/global-state.json (create it if missing), then:",
     "  export OPENROUTER_API_KEY=<unified-key>   # the CLI refuses to start without it, even with the key in the profile",
     "  roo -m fast-coder "Say hello"            # -m is required: the CLI's built-in default model shadows cli-settings.json",
+  ],
+}
+`;
+
+exports[`tool generators > setup-zcode has stable golden output 1`] = `
+{
+  "files": [
+    {
+      "arrays": {
+        "config.modelConfigRules.manualProviderModelRules": {
+          "ownedBy": {
+            "providerId": "freellmapi",
+          },
+        },
+        "config.modelConfigRules.providerModelRules": {
+          "ownedBy": {
+            "providerId": "freellmapi",
+          },
+        },
+        "config.providerConfigRules.providerRules": {
+          "ownedBy": {
+            "providerId": "freellmapi",
+          },
+        },
+        "config.providerOrder": {
+          "union": true,
+        },
+      },
+      "format": "json",
+      "path": "/home/tester/.zcode/v2/provider_config.json",
+      "sensitive": true,
+      "value": {
+        "config": {
+          "defaultModelSelection": {
+            "modelId": "fast-coder",
+            "providerId": "freellmapi",
+          },
+          "modelConfigRules": {
+            "manualProviderModelRules": [],
+            "providerModelRules": [
+              {
+                "config": {
+                  "enabled": true,
+                  "optionSpecs": {
+                    "maxOutputTokens": {
+                      "map": "{"max_tokens": maxOutputTokens}",
+                      "max": 8192,
+                    },
+                  },
+                  "properties": {
+                    "contextWindow": 131072,
+                  },
+                },
+                "modelId": "fast-coder",
+                "providerId": "freellmapi",
+              },
+              {
+                "config": {
+                  "enabled": true,
+                  "optionSpecs": {
+                    "maxOutputTokens": {
+                      "map": "{"max_tokens": maxOutputTokens}",
+                      "max": 8192,
+                    },
+                  },
+                  "properties": {
+                    "contextWindow": 262144,
+                  },
+                },
+                "modelId": "reasoning-model",
+                "providerId": "freellmapi",
+              },
+            ],
+          },
+          "providerConfigRules": {
+            "providerRules": [
+              {
+                "config": {
+                  "access": {
+                    "apiKey": "freellmapi-test-key",
+                    "type": "api-key",
+                  },
+                  "api": {
+                    "baseUrl": "http://localhost:3000/v1",
+                    "type": "openai-chat-completions",
+                  },
+                  "group": "standard-personal",
+                  "modelOrder": [
+                    "fast-coder",
+                    "reasoning-model",
+                  ],
+                  "personalModelIds": [
+                    "fast-coder",
+                    "reasoning-model",
+                  ],
+                  "visibility": "visible",
+                },
+                "enabled": true,
+                "providerId": "freellmapi",
+                "providerName": "FreeLLMAPI",
+                "templateId": null,
+              },
+            ],
+          },
+          "providerOrder": [
+            "freellmapi",
+          ],
+        },
+        "schemaVersion": 1,
+      },
+    },
+  ],
+  "notes": [
+    "Install ZCode from https://zcode.z.ai (or the community terminal client: npm i -g zcode-app-cli).",
+    "Quit ZCode Desktop before running this so it does not save its in-memory registry over the file.",
+    "freellmapi/fast-coder is now the default model; pick another under freellmapi in the model picker (or /model in the CLI). Other providers are kept.",
+    "The API key lives in the provider file (written 0600): ZCode has no env lookup for custom providers.",
   ],
 }
 `;

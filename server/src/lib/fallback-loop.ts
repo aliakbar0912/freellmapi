@@ -1,4 +1,5 @@
 import { nextMonthResetAt } from '../services/key-budget.js';
+import { benchCloudflareAccount } from '../services/cloudflare-daily-quota.js';
 // One shared provider retry/fallback loop for every OpenAI-, Responses- and
 // Anthropic-shaped chat surface (routes/proxy.ts legacy /completions and
 // /chat/completions, routes/responses.ts, routes/anthropic.ts). Each surface
@@ -17,7 +18,7 @@ import { nextMonthResetAt } from '../services/key-budget.js';
 // the fire-and-forget key revalidation kicked off on an upstream 401 (below).
 
 import type { RouteResult } from '../services/router.js';
-import { recordRateLimitHit, recordModelFailure, recordSuccess, hasOtherUsableKey, routableKeyIdsForModel, formatResetEta } from '../services/router.js';
+import { recordRateLimitHit, recordModelFailure, recordSuccess, hasOtherUsableKey, routableKeyIdsForModel, formatResetEta, isProviderMomentAttributionEnabled } from '../services/router.js';
 import { safeHeaderValue } from './header-value.js';
 import {
   recordRequest,
@@ -29,6 +30,7 @@ import {
   getPaymentRequiredCooldownMs,
   getModelForbiddenCooldownMs,
   learnLimitFromError,
+  learnContextWindowFromError,
   type CooldownDecision,
   type CooldownSource,
 } from '../services/ratelimit.js';
@@ -46,6 +48,8 @@ import {
   isProviderBadRequestError,
   isProviderDegradedError,
   isProviderLevelError,
+  isModelScopedOverloadError,
+  isProviderMomentFailure,
   isContextTooLargeError,
   isTimeoutErrorText,
   isStreamTruncatedError,
@@ -61,6 +65,7 @@ import { getRequestTrace, newRequestTrace, runWithRequestTrace, type AttemptOutc
 import { logRequest, persistRequestAttempts } from './request-log.js';
 import { withKeyProxy } from './proxy.js';
 import { getEndpointTimeBudgetMs } from './ttfb-budget.js';
+import { learnOutputCapFromError, learnedOutputCap } from './output-cap.js';
 
 // Every surface caps failover hops at the same number.
 export const FALLBACK_MAX_RETRIES = 20;
@@ -167,6 +172,14 @@ function benchKeyAcrossPlatform(
 // Precedence mirrors the response cache: the settings-table value wins when
 // present (runtime-tunable), then the env var, then the default.
 export const DEFAULT_FALLBACK_TIME_BUDGET_MS = 45_000;
+
+// #1642: streaming surfaces hold reasoning-only output uncommitted so a dead
+// attempt fails over invisibly, but the client hears nothing meanwhile and
+// idle-watchdog clients (Claude Code) hang up. Once an attempt has been
+// reasoning this long it has proven alive, so it commits (headers, status and
+// X-Routed-Via for THIS attempt) and keeps the stream audibly alive; a later
+// failure takes the surface's normal mid-stream error path.
+export const REASONING_HOLD_MAX_MS = 15_000;
 // Share of the wall-clock budget an aborted attempt must have been silent for
 // before the hedge abort counts as provider health rather than bad luck. An
 // attempt late in a ladder inherits only the scraps of the budget its
@@ -213,6 +226,10 @@ export interface FallbackState {
   // reading is the same request, not a smaller one.
   observedTotalTokens?: number;
   observedInputTokens?: number;
+  // The surface's own size estimate for this request (input + output reserve).
+  // Set right after newFallbackState(); lets a size rejection that names no
+  // window still teach the model's ceiling (#1717).
+  estimatedTotalTokens?: number;
   // The request carries `tools` (#1230). Set by the surface right after
   // newFallbackState(); lets the failure/success paths learn which models
   // reject tool calls in practice. Unset means "not a tool request".
@@ -257,6 +274,25 @@ export function msUntilNextUtcMidnight(now = Date.now()): number {
   return Math.max(next - now, 60_000);
 }
 
+const pacificDate = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles', year: 'numeric', month: 'numeric', day: 'numeric',
+});
+const pacificHour = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles', hour: 'numeric', hourCycle: 'h23',
+});
+
+/** Gemini daily quotas reset at midnight Pacific, including DST transitions.
+ * https://ai.google.dev/gemini-api/docs/rate-limits */
+export function msUntilNextPacificMidnight(now = Date.now()): number {
+  const parts = pacificDate.formatToParts(now);
+  const part = (name: string) => Number(parts.find(p => p.type === name)!.value);
+  // 08:00 UTC on the next Pacific date is either midnight (PST) or 01:00
+  // (PDT). Read the offset on that date, not now: DST days have 23/25 hours.
+  const candidate = Date.UTC(part('year'), part('month') - 1, part('day') + 1, 8);
+  const midnight = candidate - Number(pacificHour.format(candidate)) * 3_600_000;
+  return Math.max(midnight - now, 60_000);
+}
+
 /**
  * The one true cooldown-duration selection after a retryable upstream failure:
  *   - 402 out-of-credits  → a full day (PAYMENT_REQUIRED_COOLDOWN_MS)
@@ -271,6 +307,8 @@ export function msUntilNextUtcMidnight(now = Date.now()): number {
  *     provider Retry-After wins over the midnight heuristic: rolling daily
  *     windows (Groq RPD "try again in 7m12s" with a Retry-After header) reset
  *     well before midnight, and the provider knows its own reset time best.
+ *     Gemini daily violations instead wait until midnight Pacific; a shorter
+ *     RetryInfo can refer to a simultaneous per-minute violation.
  *   - anything else → the transient/daily escalation ladder, honoring the
  *     provider's Retry-After as a floor (getCooldownDurationForLimit).
  */
@@ -288,7 +326,22 @@ export function cooldownForError(route: RouteResult, err: any): number {
  * getCooldownDecisionForLimit, which tags 'authoritative' only when an explicit
  * Retry-After actually determined the expiry.
  */
+export const APINEX_CHECKIN_URL = 'https://apinex.bond/';
+export const APINEX_CHECKIN_MESSAGE =
+  `APINex Free requires a daily website visit. Open ${APINEX_CHECKIN_URL} and sign in to claim the daily check-in. ` +
+  'FreeLLMAPI will retry after a short cooldown, or you can resume the APINex key in the Keys dashboard after visiting.';
+
+/** HTTP 402 on APINex Free can mean a missing website check-in, not empty credits. */
+export function isApinexCheckinRequired(platform: string, err: any): boolean {
+  return platform === 'apinex' && err?.status === 402 &&
+    /daily check-?in required/i.test(String(err?.message ?? ''));
+}
+
 export function cooldownDecisionForError(route: RouteResult, err: any): CooldownDecision {
+  // Account-wide check-in gate. Persist its provenance, keep the existing
+  // cross-model bench, but re-attempt on real client traffic after 15 minutes.
+  // Never clear a proven 402 merely because /balance validated the key.
+  if (isApinexCheckinRequired(route.platform, err)) return { durationMs: 15 * 60_000, source: 'checkin' };
   if (isPaymentRequiredError(err)) return { durationMs: getPaymentRequiredCooldownMs(), source: 'credit' };
   // Before the model-forbidden check: a suspended account is a 403 too, but
   // it is the KEY that is out, for as long as an empty balance would be — and
@@ -296,6 +349,11 @@ export function cooldownDecisionForError(route: RouteResult, err: any): Cooldown
   if (isAccountSuspendedError(err)) return { durationMs: getPaymentRequiredCooldownMs(), source: 'credit' };
   if (isModelAccessForbiddenError(err)) return { durationMs: getModelForbiddenCooldownMs(), source: 'tier' };
   if (isDailyQuotaExhaustedError(err)) {
+    if (route.platform === 'google') {
+      // RetryInfo can describe a simultaneous per-minute violation. It cannot
+      // reopen a daily allowance before the Pacific reset (#1339).
+      return { durationMs: Math.max(msUntilNextPacificMidnight(), err?.retryAfterMs ?? 0), source: 'authoritative' };
+    }
     return { durationMs: err?.retryAfterMs ?? msUntilNextUtcMidnight(), source: 'authoritative' };
   }
   return getCooldownDecisionForLimit(
@@ -416,7 +474,9 @@ export function recordRetryableFailure(route: RouteResult, err: any, state: Fall
   // Context-too-large is MODEL-level too: a sibling key serves the same model
   // with the same context window (and, for Groq-style per-key TPM 413s, the
   // same tier ceiling), so it would reject the same request identically.
-  if (isModelNotFoundError(err) || isModelAccessForbiddenError(err) || isContextTooLargeError(err) || err?.skipModelForRequest === true) {
+  // A model-scoped overload also affects sibling keys: skip directly to a
+  // different model while keeping the rest of the provider available.
+  if (isModelNotFoundError(err) || isModelAccessForbiddenError(err) || isContextTooLargeError(err) || isModelScopedOverloadError(err) || err?.skipModelForRequest === true) {
     state.skipModels.add(route.modelDbId);
   }
   // A stale CATALOG (not a single dead model) answers model-not-found on every
@@ -473,9 +533,50 @@ export function recordRetryableFailure(route: RouteResult, err: any, state: Fall
   if (isProviderLevelError(err)) {
     state.skipPlatforms.add(route.platform);
   }
+  // An adapter's own "cannot serve this" rejection (#1876: Gizmo asked for
+  // tools or images, a catalog id outside an adapter's tested allow-list) is a
+  // fact about the request or the model id, not the key's health. Skip the
+  // model for this request only: no cooldown, so the same key keeps serving
+  // ordinary requests.
+  if (err?.providerRejection === 'request' || err?.providerRejection === 'model') {
+    state.skipModels.add(route.modelDbId);
+    return false;
+  }
+  // Too big for this model is a fact about the REQUEST, not the model's
+  // health: it still serves every smaller request. Skip it for this request
+  // (above) and learn the reported ceiling so the router sizes it out next
+  // time, but no cooldown and no penalty. Benching it let one oversized agent
+  // turn (Claude Code ships ~16k tokens of tool schemas) sink every small-TPM
+  // model it touched, so later ordinary requests found the pool rate limited.
+  if (isContextTooLargeError(err)) {
+    learnLimitFromError(route.modelDbId, err);
+    const refusedTokens = Math.max(state.estimatedTotalTokens ?? 0, state.observedTotalTokens ?? 0, state.observedInputTokens ?? 0);
+    learnContextWindowFromError(route.modelDbId, err, refusedTokens > 0 ? refusedTokens : undefined);
+    return false;
+  }
+  // A max_tokens above this model's output ceiling (Claude Code asks for
+  // 128000; Groq gpt-oss and Ollama Cloud's Nemotron stop at 65536) is the
+  // request's shape, not the model's health and not missing tool support, so
+  // it stays off the cooldown, penalty and tool-rejection books. A ceiling
+  // learned just now makes the same route usable again at once (the next
+  // attempt is clamped to it); one that was already applied and still got
+  // rejected rules the model out for this request.
+  const capBefore = learnedOutputCap(route.platform, route.modelId, route.endpointScope);
+  const ceiling = learnOutputCapFromError(route, err);
+  if (ceiling != null) {
+    if (capBefore == null || ceiling < capBefore) {
+      state.skipKeys.delete(`${route.platform}:${route.modelId}:${route.keyId}`);
+    } else {
+      state.skipModels.add(route.modelDbId);
+    }
+    return false;
+  }
   if (consumeSkipBenchExemption(route, err)) return true;
   const decision = cooldownDecisionForError(route, err);
   setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
+  // Workers AI's daily neurons pool is per ACCOUNT: bench every model on every
+  // token of the same account with this route's own duration and provenance.
+  if (route.platform === 'cloudflare') benchCloudflareAccount(route.apiKey, err, decision.durationMs, decision.source);
   // A truncated stream (200 + partial SSE, no [DONE]/finish_reason) on the
   // SAME route repeatedly is a sick edge, not bad luck — but a single one is
   // common enough on flaky free gateways that benching on first sight would
@@ -530,13 +631,26 @@ export function recordRetryableFailure(route: RouteResult, err: any, state: Fall
     // the key on every model of the platform for the credit window. Unlike a
     // suspension the platform itself stays in play: a sibling key is a
     // different wallet and may well have credits, so only THIS key is out.
-    benchKeyAcrossPlatform(route, decision.durationMs, decision.source, state, 'is out of credits (402)');
+    benchKeyAcrossPlatform(route, decision.durationMs, decision.source, state,
+      isApinexCheckinRequired(route.platform, err) ? 'requires daily website check-in' : 'is out of credits (402)');
   }
-  // Model-level failure benching: a model failing across keys (or repeatedly on
-  // one key) must sink out of routing instead of being re-picked every request.
-  noteModelFailure(route, now);
+  // #1347 (PR 1): a provider-moment failure (429 / 5xx / timeout / transport)
+  // is the provider's bad minute, not model evidence. When attribution is
+  // enabled it still steers the key via the cooldown above, but leaves the
+  // model's books (failure window, penalties) untouched — so one slow minute
+  // stops sinking a healthy model out of routing.
+  // APINex check-in is a key/account eligibility gate, not a sick model.
+  // Do not sink model reliability or rank merely because nobody visited the site.
+  const providerMoment = isApinexCheckinRequired(route.platform, err) ||
+    (isProviderMomentAttributionEnabled() && isProviderMomentFailure(err));
+  if (!providerMoment) {
+    // Model-level failure benching: a model failing across keys (or repeatedly
+    // on one key) must sink out of routing instead of being re-picked every
+    // request.
+    noteModelFailure(route, now);
+  }
   // Model-level penalty only when no sibling key can still serve (#454).
-  if (!hasOtherUsableKey(route.modelDbId, route.keyId, state.skipKeys)) {
+  if (!providerMoment && !hasOtherUsableKey(route.modelDbId, route.keyId, state.skipKeys)) {
     // Hard limit signals (429/402) carry the heavier demotion; ordinary
     // upstream failures (5xx/timeout/empty stream) get a lighter one so the
     // model sinks gradually instead of being banished on a single blip.
@@ -906,6 +1020,14 @@ export function exhaustedRetryError(lastError: any, maxRetries?: number, ctx?: E
   const everyAttempt = (cls: AttemptErrorClass | ReadonlySet<AttemptErrorClass>): boolean =>
     attempts.length > 0 && attempts.every(a => (cls instanceof Set ? cls.has(a.errorClass) : a.errorClass === cls));
 
+  if (isApinexCheckinRequired('apinex', lastError) &&
+      attempts.length > 0 && attempts.every(a => a.platform === 'apinex' && a.errorClass === 'out_of_credits')) {
+    return {
+      kind: 'rate_limit', status: 429, type: 'rate_limit_error', code: 'provider_checkin_required',
+      message: `${APINEX_CHECKIN_MESSAGE}${budgetNote}${trail}`,
+    };
+  }
+
   if (everyAttempt('auth')) {
     return {
       kind: 'auth',
@@ -1083,6 +1205,18 @@ export function routingExhaustionBody(routeErr: any): ExhaustionBody {
   const diag: string[] = Array.isArray(routeErr?.diagnostics) ? routeErr.diagnostics : [];
   const message: string = routeErr?.message ?? 'No model available to route this request';
   const classes = diag.map(classifyRoutingDiagLine);
+
+  // Only an all-APINex check-in bench may receive this actionable code.
+  // Mixed routes (including real RPM limits) keep the normal exhaustion verdict.
+  if (diag.length > 0 && diag.every(line =>
+    /^apinex\//i.test(line) && /checkin-required:\d+/.test(line) &&
+    !/\b(?:cooldown|provider-minute-cap|rpm\/rpd-limit|tpm\/tpd-limit):\d+/.test(line)
+  )) {
+    return {
+      kind: 'rate_limit', status: 429, type: 'rate_limit_error', code: 'provider_checkin_required',
+      message: APINEX_CHECKIN_MESSAGE,
+    };
+  }
 
   if (diag.length === 0 || classes.every(c => c === 'config')) {
     return {

@@ -26,6 +26,7 @@ import {
   formatAttemptTrail,
   classifyAttemptError,
   msUntilNextUtcMidnight,
+  msUntilNextPacificMidnight,
   getFallbackTimeBudgetMs,
   DEFAULT_FALLBACK_TIME_BUDGET_MS,
   AUTH_FAILURE_COOLDOWN_MS,
@@ -40,9 +41,11 @@ import {
   isKeyAuthError,
   isDailyQuotaExhaustedError,
   isProviderLevelError,
+  isModelScopedOverloadError,
   newClientAbortError,
 } from '../../lib/error-classify.js';
 import { invalidToolArgumentsError } from '../../lib/tool-validate.js';
+import { providerHttpError, providerRequestError } from '../../providers/base.js';
 import { getAllPenalties } from '../../services/router.js';
 import type { RouteResult } from '../../services/router.js';
 
@@ -120,6 +123,29 @@ describe('isKeyAuthError (401 = key-fatal, rotate instead of 502)', () => {
 });
 
 describe('isDailyQuotaExhaustedError + midnight benching (drift: 90s cooldown on a dead-for-the-day provider)', () => {
+  it.each([
+    ['2026-09-27T12:00:00Z', '2026-09-28T07:00:00Z'],
+    ['2026-01-27T12:00:00Z', '2026-01-28T08:00:00Z'],
+    ['2026-03-08T08:00:00Z', '2026-03-09T07:00:00Z'],
+    ['2026-11-01T07:00:00Z', '2026-11-02T08:00:00Z'],
+  ])('uses the Pacific reset from %s through DST', (now, reset) => {
+    expect(msUntilNextPacificMidnight(Date.parse(now))).toBe(Date.parse(reset) - Date.parse(now));
+  });
+
+  it('keeps a Gemini daily violation benched past a short RetryInfo delay', () => {
+    const err = Object.assign(new Error('Quota exceeded'), {
+      status: 429, dailyQuotaExhausted: true, retryAfterMs: 17_000,
+    });
+    expect(isDailyQuotaExhaustedError(err)).toBe(true);
+    const duration = cooldownForError(fakeRoute({ platform: 'google' }), err);
+    expect(Math.abs(duration - msUntilNextPacificMidnight())).toBeLessThan(1_000);
+  });
+
+  it('keeps a Gemini per-minute violation on the transient cooldown', () => {
+    const err = Object.assign(new Error('Quota exceeded'), { status: 429, dailyQuotaExhausted: false, retryAfterMs: 17_000 });
+    expect(cooldownForError(fakeRoute({ platform: 'google' }), err)).toBe(90_000);
+  });
+
   it('flags real daily-allocation 429 bodies', () => {
     expect(isDailyQuotaExhaustedError(new Error('Cloudflare API error 429: you have used up your daily free allocation of 10,000 neurons'))).toBe(true);
     expect(isDailyQuotaExhaustedError(new Error('Rate limit exceeded: free-models-per-day'))).toBe(true);
@@ -130,6 +156,23 @@ describe('isDailyQuotaExhaustedError + midnight benching (drift: 90s cooldown on
     expect(isDailyQuotaExhaustedError(new Error('429 Too Many Requests'))).toBe(false);
     expect(isDailyQuotaExhaustedError(new Error('tokens per minute (TPM): Limit 30000, Requested 33476'))).toBe(false);
     expect(isDailyQuotaExhaustedError(new Error('503 Service Unavailable'))).toBe(false);
+  });
+
+  // Live Groq bodies (2026-09-29): every limit error ends with the same
+  // "Upgrade to Dev Tier today" upsell, which used to read as a daily marker.
+  const GROQ_UPSELL = 'Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing';
+
+  it('does not read Groq\'s "Upgrade to Dev Tier today" upsell as a daily quota', () => {
+    const tooLarge = Object.assign(new Error(`Groq API error 413: Request too large for model \`openai/gpt-oss-20b\` in organization \`org_x\` service tier \`on_demand\` on tokens per minute (TPM): Limit 8000, Requested 12122, please reduce your message size and try again. ${GROQ_UPSELL}`), { status: 413 });
+    const perMinute = Object.assign(new Error(`Groq API error 429: Rate limit reached for model \`openai/gpt-oss-120b\` in organization \`org_x\` service tier \`on_demand\` on tokens per minute (TPM): Limit 8000, Used 6000, Requested 4000. Please try again in 15s. ${GROQ_UPSELL}`), { status: 429 });
+    expect(isDailyQuotaExhaustedError(tooLarge)).toBe(false);
+    expect(classifyAttemptError(tooLarge)).toBe('context_too_large');
+    expect(isDailyQuotaExhaustedError(perMinute)).toBe(false);
+  });
+
+  it('still flags a Groq requests-per-day 429 that carries the upsell', () => {
+    const perDay = Object.assign(new Error(`Groq API error 429: Rate limit reached for model \`llama-3.3-70b-versatile\` in organization \`org_x\` service tier \`on_demand\` on requests per day (RPD): Limit 1000, Used 1000, Requested 1. Please try again in 1m26s. Need more requests? Upgrade to Dev Tier today at https://console.groq.com/settings/billing`), { status: 429 });
+    expect(isDailyQuotaExhaustedError(perDay)).toBe(true);
   });
 
   it('cooldownForError benches a daily-allocation 429 until the next UTC midnight', () => {
@@ -156,6 +199,29 @@ describe('isDailyQuotaExhaustedError + midnight benching (drift: 90s cooldown on
       { status: 429, retryAfterMs },
     );
     expect(cooldownForError(route, err)).toBe(retryAfterMs);
+  });
+});
+
+describe('recordRetryableFailure context-length rejection (#1479)', () => {
+  it('learns the reported window and rules the model out without a cooldown or penalty', () => {
+    const modelDbId = getDb().prepare(
+      `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, context_window)
+       VALUES ('fake', ?, 'Fake', 50, 50, 1000000)`,
+    ).run(`ctx-${keySeq}`).lastInsertRowid as number;
+    const route = fakeRoute({ modelDbId });
+    const state = newFallbackState();
+    const err = Object.assign(
+      new Error("OpenRouter API error 400: This endpoint's maximum context length is 262144 tokens. However, you requested about 404225 tokens (396033 of text input, 8192 in the output)."),
+      { status: 400 },
+    );
+    recordRetryableFailure(route, err, state);
+
+    expect(state.skipModels.has(modelDbId)).toBe(true);
+    const window = (getDb().prepare('SELECT context_window FROM models WHERE id = ?').get(modelDbId) as { context_window: number }).context_window;
+    expect(window).toBe(262144);
+    const cooldown = getDb().prepare('SELECT 1 FROM rate_limit_cooldowns WHERE platform = ? AND key_id = ?').get('fake', route.keyId);
+    expect(cooldown).toBeUndefined();
+    expect(getAllPenalties().some(p => p.modelDbId === modelDbId)).toBe(false);
   });
 });
 
@@ -392,6 +458,25 @@ describe('exhaustedRetryError attempt trail + auth exhaustion', () => {
     expect(classifyAttemptError(new Error('empty completion from X'))).toBe('empty_completion');
     expect(classifyAttemptError(new Error('429 Too Many Requests'))).toBe('rate_limited');
     expect(classifyAttemptError(Object.assign(new Error('Bad Gateway'), { status: 502 }))).toBe('upstream_error');
+  });
+});
+
+describe('runFallbackLoop: provider-side 400', () => {
+  it.each([
+    ['upstream', providerHttpError(new Response(null, { status: 400 }), 'JamAI HTTP 400')],
+    ['unsupported request', providerRequestError('Gizmo does not support tools', 'request')],
+    ['unsupported model', providerRequestError('Unsupported model route', 'model')],
+  ])('moves to another route after an %s rejection', async (_name, rejection) => {
+    const routes = [fakeRoute(), fakeRoute()];
+    const dispatch = vi.fn().mockRejectedValueOnce(rejection).mockResolvedValueOnce('done');
+    const onFatal = vi.fn();
+    const attemptLog: AttemptRecord[] = [];
+    await runFallbackLoop(hooksSkeleton({
+      route: attempt => routes[attempt], dispatch, onFatal, attemptLog,
+    }));
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(onFatal).not.toHaveBeenCalled();
+    expect(attemptLog[0].errorClass).toBe(_name === 'unsupported model' ? 'model_not_found' : 'provider_bad_request');
   });
 });
 
@@ -644,6 +729,17 @@ describe('isProviderLevelError (#788: the PROVIDER is sick, not this key)', () =
     expect(isProviderLevelError(Object.assign(new Error("Function id 'x': DEGRADED function cannot be invoked"), { status: 400 }))).toBe(true);
   });
 
+  it('keeps a 5xx that blames one busy model scoped to that model, not the platform', () => {
+    // Google's per-model load shedding: sibling Gemini models on the same key
+    // still serve, so `auto` must be able to fail over within the platform.
+    expect(isProviderLevelError(Object.assign(new Error(
+      'Google API error 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.',
+    ), { status: 503 }))).toBe(false);
+    expect(isProviderLevelError(Object.assign(new Error('API error 503: The model is overloaded. Please try again later.'), { status: 503 }))).toBe(false);
+    // Generic overload wording that does not single out a model stays provider-level.
+    expect(isProviderLevelError(Object.assign(new Error('API error 503: Service temporarily overloaded'), { status: 503 }))).toBe(true);
+  });
+
   it('does not misfire on digits or wording that merely LOOK like a 5xx', () => {
     // The whole point of the structured-status rule: these all carry '500'/'503'
     // /'unavailable' in their text, and condemning the platform on any of them
@@ -715,6 +811,26 @@ describe('runFallbackLoop: a provider-level failure skips the whole platform (#7
     // wholesale, so failover spends its budget on the NEXT provider.
     expect(platformsTried(dispatch)).toEqual(['alpha', 'beta']);
     expect(state.skipPlatforms.has('alpha')).toBe(true);
+  });
+
+  it('skips sibling keys of an overloaded model but still tries a sibling model', async () => {
+    const state = newFallbackState();
+    const dispatch = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('This model is currently experiencing high demand.'), { status: 503 }))
+      .mockResolvedValueOnce('done');
+
+    await runFallbackLoop(hooksSkeleton({ maxRetries: 20, state, route: miniRouter(state), dispatch }));
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    const second = dispatch.mock.calls[1][0] as RouteResult;
+    expect(second.platform).toBe('alpha');
+    expect(second.modelId).toBe('alpha-small');
+    expect(state.skipModels.has(CANDIDATES[0].modelDbId)).toBe(true);
+    expect(state.skipPlatforms.has('alpha')).toBe(false);
+  });
+
+  it.each([undefined, 400, 429])('does not infer model overload from wording without a 5xx status (%s)', status => {
+    expect(isModelScopedOverloadError(Object.assign(new Error('This model is overloaded.'), { status }))).toBe(false);
   });
 
   it('a 401 on alpha key1 still rotates to alpha key2 (key-scoped, not provider-scoped)', async () => {
@@ -901,5 +1017,17 @@ describe('runFallbackLoop: routing-exhaustion diagnostics belong to the loop', (
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe('retryable quota errors with token counts', () => {
+  it('does not skip models or their platform because a count contains 404', () => {
+    const state = newFallbackState();
+    const routes = [fakeRoute(), fakeRoute(), fakeRoute()];
+    for (const route of routes) {
+      recordRetryableFailure(route, Object.assign(new Error('Rate limit: requested 14041 tokens'), { status: 429 }), state);
+      expect(state.skipModels.has(route.modelDbId)).toBe(false);
+    }
+    expect(state.skipPlatforms.has('fake')).toBe(false);
   });
 });

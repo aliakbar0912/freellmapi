@@ -37,6 +37,20 @@ import * as keyMonthlyBudget from '../migrations/20260904_000001_key_monthly_bud
 import * as keyMonthlyUsage from '../migrations/20260914_000001_key_monthly_usage.js';
 import * as quotaSnapshotFreshness from '../migrations/20260915_000001_quota_snapshot_freshness.js';
 import * as requestModelAttribution from '../migrations/20260913_000001_request_model_attribution.js';
+import * as customEndpointGroupLabel from '../migrations/20260930_000001_custom_endpoint_group_label.js';
+import * as modelProbeStatus from '../migrations/20261007_000001_model_probe_status.js';
+import * as searchEngines from '../migrations/20261013_000001_search_engines.js';
+import * as decisionRequests from '../migrations/20261016_000001_decision_requests.js';
+import * as llmtrReenableKeys from '../migrations/20261017_000001_llmtr_reenable_keys.js';
+import * as removeGithubProvider from '../migrations/20261017_000002_remove_github_provider.js';
+import * as requestFailureAttribution from '../migrations/20261017_233153_request_failure_attribution.js';
+import * as removeAurayProvider from '../migrations/20261019_000001_remove_auray_provider.js';
+import * as keyLastHealthyAt from '../migrations/20261020_000001_key_last_healthy_at.js';
+import * as customMediaEndpointIdentity from '../migrations/20261028_000001_custom_media_endpoint_identity.js';
+import * as cloudflareNeuronUsage from '../migrations/20261104_000001_cloudflare_neuron_usage.js';
+import * as keyVerificationBasis from '../migrations/20261105_000001_key_verification_basis.js';
+import * as modelMonthlyUsage from '../migrations/20261111_000001_model_monthly_usage.js';
+import * as profileRoutingStrategy from '../migrations/20261111_000002_profile_routing_strategy.js';
 
 export interface MigrationModule {
   up(db: Db): void;
@@ -84,8 +98,21 @@ export const MCP_ENABLED_DEFAULT_FILENAME = '20260903_000001_mcp_enabled_default
 export const RESPONSE_CACHE_FILENAME = '20260903_000002_response_cache.ts';
 export const KEY_MONTHLY_BUDGET_FILENAME = '20260904_000001_key_monthly_budget.ts';
 export const REQUEST_MODEL_ATTRIBUTION_FILENAME = '20260913_000001_request_model_attribution.ts';
+export const CUSTOM_ENDPOINT_GROUP_LABEL_FILENAME = '20260930_000001_custom_endpoint_group_label.ts';
+export const MODEL_PROBE_STATUS_FILENAME = '20261007_000001_model_probe_status.ts';
 export const KEY_MONTHLY_USAGE_FILENAME = '20260914_000001_key_monthly_usage.ts';
 export const QUOTA_SNAPSHOT_FRESHNESS_FILENAME = '20260915_000001_quota_snapshot_freshness.ts';
+export const SEARCH_ENGINES_FILENAME = '20261013_000001_search_engines.ts';
+export const DECISION_REQUESTS_FILENAME = '20261016_000001_decision_requests.ts';
+export const LLMTR_REENABLE_KEYS_FILENAME = '20261017_000001_llmtr_reenable_keys.ts';
+export const REMOVE_GITHUB_PROVIDER_FILENAME = '20261017_000002_remove_github_provider.ts';
+export const REQUEST_FAILURE_ATTRIBUTION_FILENAME = '20261017_233153_request_failure_attribution.ts';
+export const REMOVE_AURAY_PROVIDER_FILENAME = '20261019_000001_remove_auray_provider.ts';
+export const KEY_LAST_HEALTHY_AT_FILENAME = '20261020_000001_key_last_healthy_at.ts';
+export const CLOUDFLARE_NEURON_USAGE_FILENAME = '20261104_000001_cloudflare_neuron_usage.ts';
+export const KEY_VERIFICATION_BASIS_FILENAME = '20261105_000001_key_verification_basis.ts';
+export const MODEL_MONTHLY_USAGE_FILENAME = '20261111_000001_model_monthly_usage.ts';
+export const PROFILE_ROUTING_STRATEGY_FILENAME = '20261111_000002_profile_routing_strategy.ts';
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: LEGACY_BASELINE_FILENAME, module: legacyBaseline },
@@ -126,4 +153,18 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: REQUEST_MODEL_ATTRIBUTION_FILENAME, module: requestModelAttribution },
   { filename: KEY_MONTHLY_USAGE_FILENAME, module: keyMonthlyUsage },
   { filename: QUOTA_SNAPSHOT_FRESHNESS_FILENAME, module: quotaSnapshotFreshness },
+  { filename: CUSTOM_ENDPOINT_GROUP_LABEL_FILENAME, module: customEndpointGroupLabel },
+  { filename: MODEL_PROBE_STATUS_FILENAME, module: modelProbeStatus },
+  { filename: SEARCH_ENGINES_FILENAME, module: searchEngines },
+  { filename: DECISION_REQUESTS_FILENAME, module: decisionRequests },
+  { filename: LLMTR_REENABLE_KEYS_FILENAME, module: llmtrReenableKeys },
+  { filename: REMOVE_GITHUB_PROVIDER_FILENAME, module: removeGithubProvider },
+  { filename: REQUEST_FAILURE_ATTRIBUTION_FILENAME, module: requestFailureAttribution },
+  { filename: REMOVE_AURAY_PROVIDER_FILENAME, module: removeAurayProvider },
+  { filename: KEY_LAST_HEALTHY_AT_FILENAME, module: keyLastHealthyAt },
+  { filename: '20261028_000001_custom_media_endpoint_identity.ts', module: customMediaEndpointIdentity },
+  { filename: CLOUDFLARE_NEURON_USAGE_FILENAME, module: cloudflareNeuronUsage },
+  { filename: KEY_VERIFICATION_BASIS_FILENAME, module: keyVerificationBasis },
+  { filename: MODEL_MONTHLY_USAGE_FILENAME, module: modelMonthlyUsage },
+  { filename: PROFILE_ROUTING_STRATEGY_FILENAME, module: profileRoutingStrategy },
 ];

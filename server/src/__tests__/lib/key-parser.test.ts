@@ -14,6 +14,23 @@ import {
 } from '../../lib/key-parser.js';
 
 describe('key parser', () => {
+  it('imports FreeTTS credentials by environment name and provider alias', () => {
+    expect(detectPlatform('FREETTS_')).toBe('freetts');
+    expect(detectPlatform('FREE_TTS_')).toBe('freetts');
+    expect(AUTH_JSON_PROVIDER_MAP['freetts.org']).toBe('freetts');
+    expect(parseKeysFromFile('FREETTS_API_KEY=ft_live_synthetic_not_a_real_key', '.env').keys).toEqual([
+      expect.objectContaining({ platform: 'freetts', rawKey: 'FREETTS_API_KEY=ft_live_synthetic_not_a_real_key' }),
+    ]);
+  });
+  it('imports Varosity keys by environment name or provider alias', () => {
+    expect(detectPlatform('VAROSITY_')).toBe('varosity');
+    expect(detectPlatform('RIME_')).toBe('rime');
+    expect(AUTH_JSON_PROVIDER_MAP['rime.ai']).toBe('rime');
+    expect(AUTH_JSON_PROVIDER_MAP['varosity.ai']).toBe('varosity');
+    expect(parseKeysFromFile('VAROSITY_API_KEY=vsk_test_not_a_real_key_12345', '.env').keys).toEqual([
+      expect.objectContaining({ platform: 'varosity', rawKey: 'VAROSITY_API_KEY=vsk_test_not_a_real_key_12345' }),
+    ]);
+  });
   it('parses dotenv key/value files', () => {
     expect(parseDotEnv('GOOGLE_API_KEY="ai-test"\nGROQ_API_KEY=gsk-test # comment')).toEqual([
       { key: 'GOOGLE_API_KEY', value: 'ai-test' },
@@ -28,9 +45,40 @@ describe('key parser', () => {
     ]);
   });
 
+  it('drops a leading export from shell-style dotenv lines', () => {
+    expect(parseDotEnv('export GROQ_API_KEY=gsk-test\nexport\tGOOGLE_API_KEY="ai-test" # primary')).toEqual([
+      { key: 'GROQ_API_KEY', value: 'gsk-test' },
+      { key: 'GOOGLE_API_KEY', value: 'ai-test' },
+    ]);
+    const result = parseKeysFromFile('export GROQ_API_KEY=gsk_test1234567890', '.env');
+    expect(result.keys).toEqual([
+      expect.objectContaining({ rawKey: 'GROQ_API_KEY=gsk_test1234567890', platform: 'groq' }),
+    ]);
+  });
+
   it('keeps a # that is inside the quotes', () => {
     expect(parseDotEnv('NVIDIA_API_KEY="nv # test"')).toEqual([
       { key: 'NVIDIA_API_KEY', value: 'nv # test' },
+    ]);
+  });
+
+  it('drops an opening quote whose closing quote was lost', () => {
+    // Editor auto-quoting or a truncated paste yields `KEY="sk-abc` — the
+    // credential must not import with the `"` glued to its front.
+    expect(parseDotEnv('OPENAI_API_KEY="sk-abc123')).toEqual([
+      { key: 'OPENAI_API_KEY', value: 'sk-abc123' },
+    ]);
+    expect(parseDotEnv("GROQ_API_KEY='gsk-abc123")).toEqual([
+      { key: 'GROQ_API_KEY', value: 'gsk-abc123' },
+    ]);
+    // ...and the same line with a trailing inline comment.
+    expect(parseDotEnv('OPENAI_API_KEY="sk-abc123 # primary')).toEqual([
+      { key: 'OPENAI_API_KEY', value: 'sk-abc123' },
+    ]);
+    // The end-to-end import path: the value feeds the router as-is.
+    const result = parseKeysFromFile('GROQ_API_KEY="gsk_te...7890', '.env');
+    expect(result.keys).toEqual([
+      expect.objectContaining({ rawKey: 'GROQ_API_KEY=gsk_te...7890', platform: 'groq' }),
     ]);
   });
 
@@ -188,6 +236,23 @@ describe('key parser', () => {
     ]);
   });
 
+  it('parses newlines inside quoted CSV fields', () => {
+    const csv = 'platform,key,label,base_url\n"groq","gsk-test","work\nprimary",""\n';
+    expect(parseCsv(csv)).toEqual([
+      { key: 'GROQ_KEY', value: 'gsk-test', platform: 'groq', label: 'work\nprimary' },
+    ]);
+  });
+
+  it('parses multiline and normal CSV records with CRLF line endings', () => {
+    const csv = 'platform,key,label,base_url\r\n' +
+      '"groq","gsk-test","work\r\nprimary",""\r\n' +
+      '"google","AIza-test","Google Key",""\r\n';
+    expect(parseCsv(csv)).toEqual([
+      { key: 'GROQ_KEY', value: 'gsk-test', platform: 'groq', label: 'work\r\nprimary' },
+      { key: 'GOOGLE_KEY', value: 'AIza-test', platform: 'google', label: 'Google Key' },
+    ]);
+  });
+
   it('parses CSV format without header', () => {
     const csv = 'google,AIza-test,Google Key\n';
     expect(parseCsv(csv)).toEqual([
@@ -213,6 +278,18 @@ describe('key parser', () => {
       { key: 'GROQ_KEY', value: 'gsk-abc', platform: 'groq', label: 'work, primary' },
       { key: 'GOOGLE_KEY', value: 'AIza-test', platform: 'google', label: 'say "hi"' },
     ]);
+  });
+
+  it('strips the formula-guard quote from base_url as well as the label', () => {
+    // What GET /api/keys/export?format=csv writes when a custom endpoint's
+    // base_url opens with '=' — the importer has to undo the guard on the
+    // fourth column too, or the endpoint re-imports as a broken "'=..." URL.
+    const csv = 'platform,key,label,base_url\n' +
+      '"custom","sk-local","\'=HYPERLINK(""x"")","\'=HYPERLINK(""http://evil"")"\n';
+    const rows = parseCsv(csv);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.label).toBe('=HYPERLINK("x")');
+    expect(rows[0]!.baseUrl).toBe('=HYPERLINK("http://evil")');
   });
 
   it('round-trips a full export through parseKeysFromFile', () => {

@@ -30,6 +30,19 @@ contextBridge.exposeInMainWorld('__FREEAPI_PLATFORM__', process.platform);
 // runs as.
 contextBridge.exposeInMainWorld('__FREEAPI_SESSION__', () => ipcRenderer.invoke('freeapi:session-token'));
 
+// "Start on system startup" for the dashboard's Settings dialog. Mirrors the
+// popover's login-item toggle, but as a narrow get/set pair the dashboard can
+// call. Reads the OS-level "open at login" flag so the switch reflects reality
+// (and stays in sync with the popover's own toggle). Electron's login items
+// only work on macOS and Windows; on Linux setLoginItemSettings is a no-op, so
+// the bridge is not exposed there and the dashboard hides the switch.
+if (process.platform === 'darwin' || process.platform === 'win32') {
+  contextBridge.exposeInMainWorld('__FREEAPI_LOGIN_ITEM__', {
+    get: () => ipcRenderer.invoke('freeapi:get-login-item'),
+    set: (open: boolean) => ipcRenderer.invoke('freeapi:set-login-item', open),
+  });
+}
+
 // The running build's version, so the dashboard can show which one it is and
 // offer a check against the published releases (#703). Arrives the same way the
 // token does; absent in a browser, where the dashboard simply omits the row
@@ -39,6 +52,22 @@ contextBridge.exposeInMainWorld(
   '__FREEAPI_VERSION__',
   versionArg ? versionArg.slice('--freeapi-version='.length) : null,
 );
+
+// The in-app updater (the Settings update dialog and the update reminder). Like the session bridge above, deliberately
+// narrow: it can only check for, download and install the release published at
+// tashfeenahmed/freellmapi — the feed URL and signature checks live in the main
+// process and nothing here can point them anywhere else.
+contextBridge.exposeInMainWorld('__FREEAPI_UPDATER__', {
+  state: () => ipcRenderer.invoke('freeapi:update-state'),
+  check: () => ipcRenderer.invoke('freeapi:update-check'),
+  download: () => ipcRenderer.invoke('freeapi:update-download'),
+  install: () => ipcRenderer.invoke('freeapi:update-install'),
+  subscribe: (listener: (state: unknown) => void) => {
+    const handler = (_event: unknown, state: unknown) => listener(state);
+    ipcRenderer.on('freeapi:update-state', handler);
+    return () => { ipcRenderer.removeListener('freeapi:update-state', handler); };
+  },
+});
 
 // `desktop` class on <html> identifies the desktop shell. On macOS, `desktop-mac`
 // activates the translucent glass backdrop that pairs with native vibrancy;

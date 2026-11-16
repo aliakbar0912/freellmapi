@@ -118,13 +118,15 @@ interface CollapsedType {
   nullable: boolean;
 }
 
-function collapseTypeUnion(value: unknown[]): CollapsedType {
+function collapseTypeUnion(value: unknown[], hasItems: boolean): CollapsedType {
   const names = value.filter((entry): entry is string => typeof entry === 'string');
   const nullable = names.some(name => name.toLowerCase() === 'null');
   // A union of two concrete types has no Gemini equivalent; keeping the first
   // is lossy but still describes the argument, where dropping `type` entirely
-  // would let the model emit anything.
-  const concrete = names.find(name => name.toLowerCase() !== 'null');
+  // would let the model emit anything. When the schema carries `items`, keep
+  // `array` so the element schema survives (#1790).
+  const concrete = (hasItems ? names.find(isArrayType) : undefined)
+    ?? names.find(name => name.toLowerCase() !== 'null');
   return { type: concrete, nullable };
 }
 
@@ -160,6 +162,7 @@ function sanitizeSchema(schema: unknown, insidePropertiesMap: boolean, ctx: Sani
   const out: Record<string, unknown> = {};
   let nullable = false;
   let inlined: Record<string, unknown> | undefined;
+  const hasItems = 'items' in schema || 'prefixItems' in schema;
   for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
     if (insidePropertiesMap) {
       out[key] = sanitizeSchema(value, false, ctx);
@@ -176,7 +179,7 @@ function sanitizeSchema(schema: unknown, insidePropertiesMap: boolean, ctx: Sani
       continue;
     }
     if (key === 'type' && Array.isArray(value)) {
-      const collapsed = collapseTypeUnion(value);
+      const collapsed = collapseTypeUnion(value, hasItems);
       if (collapsed.type !== undefined) out.type = collapsed.type;
       nullable = nullable || collapsed.nullable;
       continue;
@@ -188,7 +191,62 @@ function sanitizeSchema(schema: unknown, insidePropertiesMap: boolean, ctx: Sani
   if (nullable) out.nullable = true;
   // Keywords written alongside a `$ref` (description, overrides) win over the
   // definition they point at.
-  return inlined ? { ...inlined, ...out } : out;
+  const merged = inlined ? { ...inlined, ...out } : out;
+  // A `properties` map is keyed by parameter names, not keywords; a tool
+  // param literally named `items` or `type` must not be read as a schema.
+  if (insidePropertiesMap) return merged;
+  return normalizeArrayItems(merged, schema as Record<string, unknown>, ctx);
+}
+
+// Gemini's Schema proto models `items` as a single Schema message and requires
+// it on every ARRAY: an array without `items` 400s with "…items: missing
+// field" (#1334 — Claude Code's nested tuple params lose their element schema
+// once `prefixItems` is stripped), and a JSON Schema tuple (`items: [...]`)
+// 400s with "Proto field is not repeating". Tuples become an `anyOf` over their
+// members, and an array with no usable element schema gets `items: {}`, which
+// Gemini accepts as "any element" (both verified against the live API).
+function normalizeArrayItems(
+  merged: Record<string, unknown>,
+  source: Record<string, unknown>,
+  ctx: SanitizeContext,
+): Record<string, unknown> {
+  const members: unknown[] = [];
+  if (Array.isArray(source.prefixItems)) {
+    members.push(...(sanitizeSchema(source.prefixItems, false, ctx) as unknown[]));
+  }
+  let single: Record<string, unknown> | undefined;
+  if (Array.isArray(merged.items)) members.push(...merged.items);
+  else if (isSchemaObject(merged.items)) single = merged.items;
+
+  if (members.length > 0) {
+    const branches = [...members, ...(single ? [single] : [])];
+    if (branches.every(isSchemaObject) && branches.every(b => Object.keys(b).length > 0)) {
+      merged.items = branches.length === 1 ? branches[0] : { anyOf: branches };
+    } else {
+      // A boolean/empty member accepts anything, so the union does too.
+      merged.items = {};
+    }
+  } else if (single === undefined && ('items' in merged || isArrayType(merged.type))) {
+    merged.items = {};
+  }
+  // Gemini accepts `items` only on an ARRAY schema; anywhere else it 400s with
+  // "…items: field predicate failed: $type == Type.ARRAY" (#1790). JSON Schema
+  // allows `items` beside any type or none, so a schema with no type and no
+  // `properties` or `anyOf` is read as an array; anything else drops the
+  // keyword it cannot use.
+  if ('items' in merged && !isArrayType(merged.type)) {
+    if (merged.type === undefined && !('properties' in merged) && !('anyOf' in merged)) merged.type = 'array';
+    else delete merged.items;
+  }
+  return merged;
+}
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isArrayType(type: unknown): boolean {
+  return typeof type === 'string' && type.toLowerCase() === 'array';
 }
 
 function serializeResponse(value: unknown): string {

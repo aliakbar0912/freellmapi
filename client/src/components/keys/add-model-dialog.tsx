@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { X, Sparkles, Loader2 } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
+import { invalidateSearchQueries } from '@/lib/search'
 import { Dialog, DialogClose, DialogPopup, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,7 +13,7 @@ import { FieldError } from '@/components/ui/field-error'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
 import type { ApiKey } from '@freellmapi/shared/types'
-import { PLATFORMS, CUSTOM_GROUP } from '@/components/keys/shared'
+import { LISTED_PLATFORMS, CUSTOM_GROUP } from '@/components/keys/shared'
 
 export interface AddModelDialogProps {
   open: boolean
@@ -78,6 +79,7 @@ function AddModelForm({ open, onOpenChange, initialPlatform, initialKeyId }: Add
       queryClient.invalidateQueries({ queryKey: ['models'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
       queryClient.invalidateQueries({ queryKey: ['keys'] })
+      invalidateSearchQueries(queryClient)
       toast.success(t('keys.modelAddedSuccess'))
       onOpenChange(false)
     },
@@ -127,7 +129,7 @@ function AddModelForm({ open, onOpenChange, initialPlatform, initialKeyId }: Add
     addModelMutation.mutate(payload)
   }
 
-  const allProviders = [...PLATFORMS, CUSTOM_GROUP]
+  const allProviders = [...LISTED_PLATFORMS, CUSTOM_GROUP]
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

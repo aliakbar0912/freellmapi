@@ -26,12 +26,14 @@ import {
   runFallbackLoop,
   setExhaustionHeaders,
   setFallbackHeaders,
+  REASONING_HOLD_MAX_MS,
   type AttemptRecord,
   type ExhaustionBody,
 } from './fallback-loop.js';
 import { routedViaValue } from './header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from './guardrails.js';
-import { contentToString } from './content.js';
+import { contentToString, estimateInputTokens } from './content.js';
+import { routeOutputBudget } from './output-cap.js';
 import { normalizeMessageImages } from './image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from './tool-args.js';
 import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from './tool-validate.js';
@@ -84,15 +86,6 @@ export interface InboundChatWire {
   sendToolCalls?(res: Response, route: RouteResult, calls: ChatToolCall[]): void;
   finishStream(res: Response, result: InboundChatResult): void;
   sendStreamError?(res: Response, message: string): void;
-}
-
-function estimateTokens(messages: ChatMessage[]): number {
-  return messages.reduce((sum, message) => {
-    const text = contentToString(message.content);
-    const calls = (message.tool_calls ?? [])
-      .reduce((n, call) => n + call.function.name.length + call.function.arguments.length, 0);
-    return sum + Math.ceil((text.length + calls) / 4);
-  }, 0);
 }
 
 function hasImages(messages: ChatMessage[]): boolean {
@@ -181,7 +174,7 @@ export async function runInboundChat(
   // token budgets, payload limits, and upstream transfers all see the shrunk
   // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
   await normalizeMessageImages(input.messages);
-  const estimatedInputTokens = estimateTokens(input.messages);
+  const estimatedInputTokens = estimateInputTokens(input.messages, input.tools);
   const budget = applyTokenBudget(estimatedInputTokens, input.maxTokens);
   if (budget.rejection) {
     wire.sendError(res, 413, tokenBudgetMessage(budget.rejection), 'request_token_budget');
@@ -209,6 +202,7 @@ export async function runInboundChat(
   // (#956 review).
   const outputReserve = routingReserveTokens(maxTokens);
   const estimatedTotal = estimatedInputTokens + outputReserve;
+  state.estimatedTotalTokens = estimatedTotal;
   const schemas = toolSchemaMap(input.tools);
   let clientGone = false;
   const clientAbort = new AbortController();
@@ -263,7 +257,7 @@ export async function runInboundChat(
           route.apiKey,
           input.messages,
           route.modelId,
-          options,
+          { ...options, contextBudget: routeOutputBudget(route, estimatedInputTokens) },
         );
         const message = result.choices?.[0]?.message;
         let text = contentToString(message?.content ?? '');
@@ -373,6 +367,7 @@ export async function runInboundChat(
       // invisibly, instead of locking the ladder on a blank reply. Flushed in
       // order (before the text/tool output) the moment the stream commits.
       let heldReasoning = '';
+      const attemptStart = Date.now();
       const commit = () => {
         if (committed) return;
         res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
@@ -390,7 +385,7 @@ export async function runInboundChat(
           route.apiKey,
           input.messages,
           route.modelId,
-          options,
+          { ...options, contextBudget: routeOutputBudget(route, estimatedInputTokens) },
         );
         for await (const chunk of stream) {
           if (clientGone) break;
@@ -425,6 +420,8 @@ export async function runInboundChat(
           if (typeof deltaReasoning === 'string' && deltaReasoning) {
             reasoning += deltaReasoning;
             outputTokens += Math.ceil(deltaReasoning.length / 4);
+            // #1642: long reasoning with nothing sent yet: commit, then stream it live.
+            if (!committed && wire.sendReasoningDelta && Date.now() - attemptStart >= REASONING_HOLD_MAX_MS) commit();
             if (committed) {
               wire.sendReasoningDelta?.(res, route, deltaReasoning);
             } else {
@@ -488,9 +485,10 @@ export async function runInboundChat(
         // Opt-in schema verdict, before the tool calls are committed. Tool
         // calls are buffered to the end of the stream on this path, so a
         // tool-only turn has sent nothing yet and can still fail over. A turn
-        // that already streamed text is past its commit point — leave it
+        // that already streamed real text is past its commit point — leave it
         // alone rather than tearing down a stream the client is reading.
-        if (isToolArgumentValidationEnabled() && toolCalls.length > 0 && !committed) {
+        // Whitespace or an early reasoning commit (#1642) is not real text.
+        if (isToolArgumentValidationEnabled() && toolCalls.length > 0 && (!committed || !text.trim())) {
           const invalid = invalidToolCallReasons(toolCalls, schemas);
           if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
         }

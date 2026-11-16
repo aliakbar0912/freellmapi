@@ -105,7 +105,7 @@ const declarativeConfigSchema = z.object({
   models: z.array(modelSchema).optional(),
   fallback: z.array(fallbackEntrySchema).optional(),
   routing: z.object({
-    strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']),
+    strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom', 'decision']),
     weights: z.object({
       reliability: z.number().nonnegative(),
       speed: z.number().nonnegative(),
@@ -466,7 +466,7 @@ function applyFallback(db: Db, entries: z.infer<typeof fallbackEntrySchema>[]): 
 export function applyDeclarativeConfig(input: unknown, source = 'inline'): DeclarativeConfigResult {
   const parsed = declarativeConfigSchema.safeParse(input);
   if (!parsed.success) {
-    throw new Error(`invalid declarative config: ${parsed.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')}`);
+    throw new Error(`invalid declarative config: ${parsed.error.issues.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')}`);
   }
 
   const db = getDb();

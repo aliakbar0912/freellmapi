@@ -9,11 +9,12 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, resolveRoutingChain, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
+import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, resolveRoutingChain, failureAttributionFor, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { getDb } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt } from '../lib/system-prompt.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
-import { contentToString, messageHasImage } from '../lib/content.js';
+import { contentToString, estimateInputTokens, messageHasImage } from '../lib/content.js';
+import { routeOutputBudget } from '../lib/output-cap.js';
 import { resolveTaskType } from '../lib/task-type.js';
 import { normalizeMessageImages } from '../lib/image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -24,6 +25,7 @@ import {
   getRequestGroupId,
   getStickyModel,
   setStickyModel,
+  sessionIdentityMessages,
   streamReasoningText,
   completionReasoningText,
   traceRouteEvent,
@@ -31,6 +33,7 @@ import {
 } from './proxy.js';
 import { runFallbackLoop, newFallbackState, fallbackRoutingTokens, recordUpstreamSuccess, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { routedViaValue, safeHeaderValue } from '../lib/header-value.js';
+import { startStreamKeepalive, streamKeepaliveMs } from '../lib/stream-keepalive.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { samplingParamSchemaFields, pickSamplingParams, type ResponseFormat } from '../lib/sampling-params.js';
 import { enforceJsonContent } from '../lib/structured-output.js';
@@ -38,6 +41,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isClientAbortError, newClientAbortError, newHedgeAbortError } from '../lib/error-classify.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
+import { maybeServeResponsesWebSearch, webSearchCallToText } from '../lib/responses-web-search.js';
 import {
   FUSION_MODEL_ID,
   FusionError,
@@ -46,6 +50,8 @@ import {
   runFusion,
   type FusionResult,
 } from '../services/fusion.js';
+import { applyDecisionRouting, routingStrategyHeader } from '../services/routing-decision.js';
+import { resolveListedClaudeAlias } from '../services/anthropic-map.js';
 
 export const responsesRouter = Router();
 
@@ -351,10 +357,29 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
   }
 
   const messages: ChatMessage[] = [];
+  // Replayed web_search_call items (served by the gateway's search pool, or
+  // by OpenAI) become a short note on the assistant turn that follows, so the
+  // model keeps the context of what it searched without an extra assistant
+  // turn (consecutive assistant turns 400 on strict upstreams, #96).
+  let pendingSearchNotes: string[] = [];
+  const flushSearchNotes = () => {
+    if (pendingSearchNotes.length === 0) return;
+    messages.push({ role: 'assistant', content: pendingSearchNotes.join('\n') });
+    pendingSearchNotes = [];
+  };
 
   const items = req.input;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
+
+    if ('type' in item && item.type === 'web_search_call') {
+      const note = webSearchCallToText(item as Record<string, unknown>);
+      if (note) pendingSearchNotes.push(note);
+      continue;
+    }
+    if (!('type' in item && item.type === 'message' && (item as { role?: string }).role === 'assistant')) {
+      flushSearchNotes();
+    }
 
     if ('type' in item && item.type === 'function_call') {
       // Parallel tool calls replay as consecutive standalone function_call
@@ -372,7 +397,14 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
         });
         j++;
       }
-      messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+      // A flushed search note, or an assistant message separated from these
+      // calls by a skipped reasoning item, is already the assistant turn.
+      const last = messages[messages.length - 1];
+      if (last?.role === 'assistant' && !last.tool_calls) {
+        last.tool_calls = toolCalls;
+      } else {
+        messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+      }
       i = j - 1;
       continue;
     }
@@ -398,7 +430,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     const m = item as z.infer<typeof messageItemSchema>;
     // 'developer' is the Responses-era system role.
     const role = m.role === 'developer' ? 'system' : m.role;
-    const content = partsToChatContent(m.content);
+    let content = partsToChatContent(m.content);
 
     if (role === 'system') {
       // Hoist system/developer messages to the start of the conversation:
@@ -410,6 +442,14 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     }
 
     if (role === 'assistant') {
+      const searchNotes = pendingSearchNotes;
+      pendingSearchNotes = [];
+      if (searchNotes.length > 0) {
+        const notes = searchNotes.join('\n');
+        content = typeof content === 'string'
+          ? (content.length > 0 ? `${notes}\n\n${content}` : notes)
+          : [{ type: 'text', text: notes }, ...content];
+      }
       // A Responses assistant turn is a message item followed by its
       // function_call items. Merge them into a single chat assistant message
       // (content + tool_calls); emitting consecutive assistant turns makes
@@ -443,6 +483,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
 
     messages.push({ role, content });
   }
+  flushSearchNotes();
 
   return [...systemMessages, ...messages];
 }
@@ -477,6 +518,16 @@ function requestDeclaresToolUse(req: ResponsesRequest): boolean {
 }
 
 // ── Build the final (non-stream) Responses object ─────────────────────────
+/**
+ * Responses-API `incomplete_details.reason` for an upstream chat finish
+ * reason, or undefined when the response ran to completion.
+ */
+export function incompleteReason(finishReason: string | null | undefined): 'max_output_tokens' | 'content_filter' | undefined {
+  if (finishReason === 'length') return 'max_output_tokens';
+  if (finishReason === 'content_filter') return 'content_filter';
+  return undefined;
+}
+
 export function buildResponseObject(opts: {
   id: string;
   model: string;
@@ -485,14 +536,16 @@ export function buildResponseObject(opts: {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens?: number;
+  cachedTokens?: number;
   metadata?: Record<string, string>;
+  incompleteReason?: 'max_output_tokens' | 'content_filter';
 }) {
   const output: any[] = [];
   if (opts.text.length > 0) {
     output.push({
       type: 'message',
       id: newId('msg'),
-      status: 'completed',
+      status: opts.incompleteReason ? 'incomplete' : 'completed',
       role: 'assistant',
       content: [{ type: 'output_text', text: opts.text, annotations: [] }],
     });
@@ -512,13 +565,14 @@ export function buildResponseObject(opts: {
     id: opts.id,
     object: 'response',
     created_at: nowUnix(),
-    status: 'completed',
+    status: opts.incompleteReason ? 'incomplete' : 'completed',
+    ...(opts.incompleteReason ? { incomplete_details: { reason: opts.incompleteReason } } : {}),
     model: opts.model,
     output,
     output_text: opts.text,
     usage: {
       input_tokens: opts.promptTokens,
-      input_tokens_details: { cached_tokens: 0 },
+      input_tokens_details: { cached_tokens: opts.cachedTokens ?? 0 },
       output_tokens: opts.completionTokens,
       output_tokens_details: { reasoning_tokens: opts.reasoningTokens ?? 0 },
       total_tokens: opts.promptTokens + opts.completionTokens,
@@ -550,6 +604,7 @@ function buildFusionResponseObject(id: string, result: FusionResult): Record<str
     promptTokens: usage?.prompt_tokens ?? 0,
     completionTokens: usage?.completion_tokens ?? 0,
     reasoningTokens: usage?.completion_tokens_details?.reasoning_tokens,
+    cachedTokens: usage?.prompt_tokens_details?.cached_tokens,
     metadata: fusionResponseMetadata(fusionResponse),
   }) as Record<string, unknown>;
 
@@ -620,7 +675,15 @@ function quotaContextForRoute(route: RouteResult, endpoint: string): QuotaObserv
   };
 }
 
+// A `web_search` tool is served through the search loop
+// (lib/responses-web-search.ts) when a search key exists; it re-enters
+// handleResponses once per model turn. Everything else goes straight through.
 responsesRouter.post('/responses', async (req: Request, res: Response) => {
+  if (await maybeServeResponsesWebSearch(handleResponses, req, res)) return;
+  await handleResponses(req, res);
+});
+
+export async function handleResponses(req: Request, res: Response): Promise<void> {
   const start = Date.now();
   const requestGroupId = getRequestGroupId(req);
   res.setHeader('X-Request-ID', requestGroupId);
@@ -637,7 +700,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   if (!parsed.success) {
     res.status(400).json({
       error: {
-        message: `Invalid request: ${parsed.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ')}`,
+        message: `Invalid request: ${parsed.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ')}`,
         type: 'invalid_request_error',
       },
     });
@@ -707,6 +770,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     return Array.isArray(content)
       && content.some(block => block && typeof block === 'object' && 'cache_control' in block);
   });
+  // Session identity before compression can rewrite the first user turn (#1889).
+  const sessionMessages = sessionIdentityMessages(messages);
   const compressionResult = compressRequest(messages, {
     header: req.headers['x-freellm-compress'],
     tools,
@@ -725,10 +790,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
   await normalizeMessageImages(messages);
 
-  const estimatedInputTokens = messages.reduce(
-    (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
-    0,
-  );
+  const estimatedInputTokens = estimateInputTokens(messages, tools);
 
   // Image requests must route to a vision-capable model (mirrors
   // /chat/completions, proxy.ts). Reject up front with a clear message when
@@ -774,6 +836,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     ?? req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
   const requestedModelLabel = reqData.model ?? 'auto';
+  // What routing acts on. Usually the id the client sent; a Claude alias from
+  // GET /v1/models routes through the Claude family map instead (a pinned
+  // model, auto, or a tier pool), the same as on /v1/messages.
+  const claudeAlias = resolveListedClaudeAlias(reqData.model);
+  const routedModel = claudeAlias?.kind === 'model' ? claudeAlias.modelId : claudeAlias ? 'auto' : requestedModelLabel;
+  const aliasTierChain = claudeAlias?.kind === 'tier' ? resolveModelGroupCandidates(claudeAlias.dbIds) : [];
 
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
@@ -787,9 +855,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // stays on the unscoped key so existing session affinity is unchanged.
   let stickyStrategyKey: string | undefined;
 
-  if (isAutoModel(requestedModelLabel)) {
+  if (aliasTierChain.length > 0) {
+    // Strict over the tier's pool; an empty tier falls through to plain auto.
+    groupChain = aliasTierChain;
+    stickyStrategyKey = `tier:${aliasTierChain[0]!.model_db_id}`;
+    const sticky = getStickyModel(sessionMessages, sessionIdHeader, stickyStrategyKey);
+    preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
+  } else if (isAutoModel(routedModel)) {
     try {
-      resolvedChain = resolveRoutingChain(requestedModelLabel);
+      resolvedChain = resolveRoutingChain(routedModel);
     } catch (err: any) {
       if (err?.status === 400) {
         res.status(400).json({
@@ -801,15 +875,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
     stickyStrategyKey = resolvedChain.strategyKey === 'auto' ? undefined : resolvedChain.strategyKey;
     preferredModel = resolveStickyPreference(
-      getStickyModel(messages, sessionIdHeader, stickyStrategyKey),
+      getStickyModel(sessionMessages, sessionIdHeader, stickyStrategyKey),
       resolvedChain.chain,
     );
-  } else if (isFusionModel(requestedModelLabel)) {
+  } else if (isFusionModel(routedModel)) {
     // Fusion is a virtual model, not a row in the catalog. Its panel and
     // judge each resolve through the normal router inside runFusion below.
   } else {
     const db = getDb();
-    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModelLabel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(routedModel, getModelGroups()) : null;
     const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
       groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
@@ -819,25 +893,28 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
         res.status(400).json({
           error: {
-            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            message: `Model '${routedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
             type: 'invalid_request_error',
             code: 'model_not_found',
           },
         });
         return;
       }
-      const sticky = getStickyModel(messages, sessionIdHeader, requestedModelLabel);
+      // Read and write the group's sticky member under the same key; the
+      // success path saves under stickyStrategyKey, as on /v1/chat/completions.
+      stickyStrategyKey = routedModel;
+      const sticky = getStickyModel(sessionMessages, sessionIdHeader, stickyStrategyKey);
       preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModelLabel) as { id: number } | undefined;
+      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(routedModel) as { id: number } | undefined;
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModelLabel) as { id: number } | undefined;
+        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(routedModel) as { id: number } | undefined;
         const reason = disabled ? 'is disabled' : 'is not in the catalog';
         res.status(400).json({
           error: {
-            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            message: `Model '${routedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
             type: 'invalid_request_error',
             code: 'model_not_found',
           },
@@ -868,6 +945,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const state = newFallbackState();
   // Lets the failover loop learn which models reject tool calls (#1230).
   state.wantsTools = wantsTools;
+  state.estimatedTotalTokens = estimatedTotal;
   const attemptLog: AttemptRecord[] = [];
   // Client-disconnect fan-out: the flag stops the loop before the NEXT
   // attempt; the AbortController (threaded to the provider as
@@ -894,7 +972,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // virtual id before normal model dispatch; do the same here after the common
   // Responses translation/guardrails so Codex and other Responses clients can
   // opt into the exact same panel + judge behavior.
-  if (isFusionModel(requestedModelLabel)) {
+  if (isFusionModel(routedModel)) {
     const fusionConfig = reqData.fusion ?? {};
     const fusionOptions = { ...dispatchOpts };
 
@@ -916,6 +994,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             error: {
               message: err.message,
               type: err.status === 429 ? 'rate_limit_error' : err.status >= 500 ? 'server_error' : 'invalid_request_error',
+              ...(err.code ? { code: err.code } : {}),
             },
           });
         } else {
@@ -1098,11 +1177,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       const type = err instanceof FusionError
         ? (err.status === 429 ? 'rate_limit_error' : err.status >= 500 ? 'server_error' : 'invalid_request_error')
         : 'server_error';
+      const code = err instanceof FusionError ? err.code : undefined;
       fusionSse('response.failed', {
         response: {
           ...skeleton,
           status: 'failed',
-          error: { message, type },
+          error: { message, type, ...(code ? { code } : {}) },
         },
       });
       res.end();
@@ -1124,6 +1204,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify({ type: event, sequence_number: seq++, ...payload })}\n\n`);
   };
 
+  // Decision routing (#1354): with the 'decision' strategy on, a decision
+  // model picks which preset (Smartest / Fastest / Balanced / Most reliable)
+  // this turn routes with. Skipped when the client pinned a model or the
+  // conversation is sticky to one. Any doubt routes as Balanced.
+  const routingPick = await applyDecisionRouting(messages, { pinned: !isAutoModel(routedModel) || preferredModel != null, preset: resolvedChain?.strategyOverride, signal: clientAbort.signal });
+  if (routingPick && !res.headersSent) res.setHeader('X-FreeLLM-Routing-Strategy', routingStrategyHeader(routingPick));
+
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -1138,10 +1225,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       // size latched onto state so the existing size gates in router.ts skip
       // low-TPM / small-context models on retry.
       const routingTotal = fallbackRoutingTokens(state, estimatedTotal, outputReserve);
-      return routeRequest(routingTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, outputReserve, taskType);
+      return routeRequest(routingTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, outputReserve, taskType, resolvedChain?.strategyOverride);
     },
     dispatch: async (route, attempt, ctx) => {
-      const contextBudget = route.contextWindow != null ? route.contextWindow - estimatedInputTokens : undefined;
+      const contextBudget = routeOutputBudget(route, estimatedInputTokens);
       const routeOpts = contextBudget != null ? { ...dispatchOpts, contextBudget } : dispatchOpts;
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',
@@ -1182,6 +1269,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         let dialectMode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
         let heldText = '';
         let upstreamFinish: string | null = null;
+        let upstreamUsage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } | undefined;
 
         // Commit point: headers + the response.created/in_progress skeleton go
         // out only when the first MEANINGFUL output item is about to be emitted
@@ -1192,11 +1280,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         const commit = () => {
           if (streamStarted) return;
           if (ttfbMs === null) ttfbMs = Date.now() - start;
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
-          setFallbackHeaders(res, attempt, attemptLog);
+          sendSseHeaders();
           const skeleton = {
             id: responseId, object: 'response', created_at: nowUnix(),
             status: 'in_progress', model: route.modelId, output: [], output_text: '',
@@ -1208,6 +1292,34 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // longer cancel this attempt (it could not fail over now anyway).
           ctx.disarmHedge();
         };
+
+        // Send the SSE headers once. Split out of commit so the #1642
+        // keep-alive can commit the response with a content-free ping while
+        // the hold window is still open, without sending the event skeleton
+        // early.
+        let headersSentEarly = false;
+        const sendSseHeaders = () => {
+          if (headersSentEarly) return;
+          res.setHeader('Content-Type', 'text/event-stream');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
+          setFallbackHeaders(res, attempt, attemptLog);
+          headersSentEarly = true;
+        };
+
+        // #1642: optional heartbeat for the silent reasoning window. A bare
+        // SSE comment resets client idle watchdogs without committing content.
+        let streamSettled = false;
+        const keepaliveStop = startStreamKeepalive(streamKeepaliveMs(),
+          () => streamSettled,
+          () => {
+            sendSseHeaders();
+            // Bytes on the wire = the response can no longer fail over
+            // invisibly; stop the retry budget from cancelling it.
+            ctx.disarmHedge();
+            res.write(': keepalive\n\n');
+          });
 
         // Open the text output item and stream `text` as its first delta.
         // The text item takes the next free output index (it is NOT always 0 —
@@ -1251,6 +1363,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             if (anyChunk.error && !anyChunk.choices) {
               throw new Error(`in-band provider error from ${route.displayName}: ${anyChunk.error.message ?? 'provider error'}`);
             }
+
+            // Usage comes on its own choice-less frame or on the last choice
+            // frame, as on /chat/completions.
+            if (anyChunk.usage) upstreamUsage = anyChunk.usage;
 
             const choice0 = chunk.choices?.[0];
             if (choice0?.finish_reason) upstreamFinish = choice0.finish_reason;
@@ -1388,11 +1504,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             );
           }
 
+          // A truncated or filtered turn ends as `incomplete`, not `completed`,
+          // so clients don't take a cut-off answer as the whole answer.
+          const incomplete = incompleteReason(upstreamFinish);
+
           // Finalize any open text item.
           if (msgItemId !== null) {
             sse('response.output_text.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, text: msgText });
             sse('response.content_part.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
-            sse('response.output_item.done', { output_index: textOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
+            sse('response.output_item.done', { output_index: textOutputIndex, item: { id: msgItemId, type: 'message', status: incomplete ? 'incomplete' : 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
           }
           // Finalize tool-call items. Arguments are repaired against the tool's
           // parameter schema at this point (after the full string accumulated):
@@ -1419,16 +1539,19 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             finalToolCalls.push({ id: acc.callId, type: 'function', function: { name: acc.name, arguments: repairedArgs } });
           }
 
+          const inputTokens = upstreamUsage?.prompt_tokens ?? estimatedInputTokens;
+          const outputTokens = upstreamUsage?.completion_tokens ?? totalOutputTokens;
           const finalResponse = buildResponseObject({
             id: responseId, model: route.modelId, text: msgText,
-            toolCalls: finalToolCalls, promptTokens: estimatedInputTokens, completionTokens: totalOutputTokens,
-            reasoningTokens: totalReasoningTokens,
+            toolCalls: finalToolCalls, promptTokens: inputTokens, completionTokens: outputTokens,
+            reasoningTokens: upstreamUsage?.completion_tokens_details?.reasoning_tokens ?? totalReasoningTokens,
+            incompleteReason: incomplete,
           });
-          sse('response.completed', { response: finalResponse });
+          sse(incomplete ? 'response.incomplete' : 'response.completed', { response: finalResponse });
           res.end();
 
-          recordUpstreamSuccess(route, estimatedInputTokens + totalOutputTokens, state);
-          setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+          recordUpstreamSuccess(route, upstreamUsage?.total_tokens ?? inputTokens + outputTokens, state);
+          setStickyModel(sessionMessages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
           traceRouteEvent('Responses', {
             event: 'ok',
             requestId: requestGroupId,
@@ -1436,10 +1559,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             platform: route.platform,
             model: route.modelId,
             latencyMs: Date.now() - start,
-            inputTokens: estimatedInputTokens,
-            outputTokens: totalOutputTokens,
+            inputTokens,
+            outputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, null, null, 'http');
+          logRequest(route.platform, route.modelId, route.keyId, 'success', inputTokens, outputTokens, Date.now() - start, null, ttfbMs, null, null, 'http');
           return 'done';
         } catch (streamErr: any) {
           // Client abort mid-stream: the pump's own `if (clientGone) break`
@@ -1451,7 +1574,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // A committed stream can't fail over (bytes already sent) — surface a
           // response.failed event honestly and stop. A pre-commit failure throws
           // through to the shared loop for cooldown + failover.
-          if (streamStarted) {
+          // streamStarted = real events went out. headersSentEarly also counts:
+          // a #1642 keep-alive ping flushed the SSE headers, so this attempt is
+          // on the wire and can no longer fail over invisibly.
+          if (streamStarted || headersSentEarly) {
             const safe = sanitizeProviderErrorMessage(streamErr.message);
             traceRouteEvent('Responses', {
               event: 'fail',
@@ -1462,12 +1588,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: safe,
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safe, ttfbMs, null, null, 'http');
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safe, ttfbMs, null, null, 'http', failureAttributionFor(streamErr));
             sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } } });
             res.end();
             return 'committed';
           }
           throw streamErr;
+        } finally {
+          // #1642: this attempt is over whichever path it left by — the
+          // keep-alive interval must not outlive it.
+          streamSettled = true;
+          keepaliveStop();
         }
       }
 
@@ -1553,13 +1684,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       // tokens against the rate-limit ledger; promptTokens/completionTokens
       // above already carry the chars/4 estimate.
       recordUpstreamSuccess(route, result.usage?.total_tokens ?? (promptTokens + completionTokens), state);
-      setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+      setStickyModel(sessionMessages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
 
       res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       res.json(buildResponseObject({
         id: responseId, model: route.modelId, text, toolCalls,
         promptTokens, completionTokens, reasoningTokens,
+        cachedTokens: result.usage?.prompt_tokens_details?.cached_tokens,
+        incompleteReason: incompleteReason(result.choices[0]?.finish_reason),
       }));
 
       traceRouteEvent('Responses', {
@@ -1587,7 +1720,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, null, null, 'http');
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, null, null, 'http', failureAttributionFor(err));
     },
     onFatal: (route, err, attempt) => {
       setFallbackHeaders(res, attempt, attemptLog);
@@ -1618,4 +1751,4 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
     },
   });
-});
+}

@@ -68,7 +68,8 @@ describe('Fallback API', () => {
     const db = getDb();
     const target = db.prepare(`
       SELECT id, platform, model_id FROM models
-       WHERE platform = 'github' AND model_id = 'openai/gpt-4.1'
+       WHERE platform = 'groq'
+       ORDER BY id LIMIT 1
     `).get() as { id: number; platform: string; model_id: string };
     const other = db.prepare(`
       SELECT platform, model_id FROM models
@@ -103,6 +104,12 @@ describe('Fallback API', () => {
       modelId: target.model_id,
       used: 168,
     });
+
+    // Retention removes raw request rows, not this month's consumed tokens.
+    db.prepare('DELETE FROM requests WHERE platform = ? AND model_id = ?').run(target.platform, target.model_id);
+    const afterPrune = await request(app, 'GET', '/api/fallback/token-usage');
+    expect(afterPrune.body.totalUsed).toBe(168);
+    expect(afterPrune.body.models.find((m: any) => m.modelDbId === target.id).used).toBe(168);
   });
 
   // The budget bar's legend follows this payload's order. Chain priority is
@@ -457,5 +464,15 @@ describe('Fallback API', () => {
   it('POST /api/fallback/sort/invalid returns 400', async () => {
     const { status } = await request(app, 'POST', '/api/fallback/sort/invalid');
     expect(status).toBe(400);
+  });
+
+  it('POST /api/fallback/sort/constructor returns 400, not 500', async () => {
+    // Inherited Object members (`constructor`, `toString`, …) are truthy, so
+    // a bare `SORT_PRESETS[preset]` read used to pass the whitelist guard and
+    // crash `prepare()` when the function object got interpolated into SQL.
+    const { status } = await request(app, 'POST', '/api/fallback/sort/constructor');
+    expect(status).toBe(400);
+    const { status: tsStatus } = await request(app, 'POST', '/api/fallback/sort/toString');
+    expect(tsStatus).toBe(400);
   });
 });
